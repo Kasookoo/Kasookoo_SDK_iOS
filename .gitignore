@@ -1,0 +1,37 @@
+# macOS
+.DS_Store
+._*
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Sensitive files - NEVER commit
+GoogleService-Info.plist
+google-services.json
+*.p8
+AuthKey_*.p8
+*.mobileprovision
+*.provisionprofile
+*.cer
+*.p12
+.env
+.env.*
+secrets.plist
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+*.tmp
+*.bak
