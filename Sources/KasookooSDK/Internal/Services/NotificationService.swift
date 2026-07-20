@@ -4,6 +4,13 @@
 //
 //
 
+//
+//  NotificationService.swift
+//  KasookooSDK
+//
+//  Implements NotificationServicing — FCM-based push notification management.
+//
+
 import Foundation
 import UIKit
 
@@ -74,6 +81,34 @@ internal actor NotificationService: NotificationServicing {
     }
     
     // MARK: - Device Registration (FCM)
+    
+    // MARK: - Convenience: Register Using the Identified User
+    
+    /// Registers this device without the caller having to know the backend's
+    /// user id — it is resolved from the identity established by `identify()`.
+    func registerDevice(
+        fcmToken: String,
+        deviceInfo: DeviceInfo? = nil
+    ) async throws {
+        guard let profile = await stateStore.identifiedUser else {
+            throw KasookooError.configInvalid(
+                "Cannot register for push: no user is identified. Call identify() before registerDevice()."
+            )
+        }
+        
+        guard let userId = await stateStore.resolveUserId(forEmail: profile.email) else {
+            throw KasookooError.configInvalid(
+                "Cannot register for push: the backend user id for \(profile.email) is not known. Ensure identify() completed successfully."
+            )
+        }
+        
+        try await registerDevice(
+            fcmToken: fcmToken,
+            userId: userId,
+            userType: profile.type,
+            deviceInfo: deviceInfo ?? DeviceInfo.current()
+        )
+    }
     
     func registerDevice(
         fcmToken: String,
@@ -231,9 +266,28 @@ internal actor NotificationService: NotificationServicing {
             callee: info.callee,
             state: .ringing,
             direction: .incoming,
-            createdAt: Date()
+            createdAt: Date(),
+            isSip: isSip
         )
         await stateStore.addCall(callInfo)
+        
+        // ─── Persist the LiveKit credentials that arrived with the push ──────
+        //
+        // This is what makes an accepted incoming call actually produce audio.
+        // The callee never calls a token endpoint — the backend hands the token
+        // over inside the push. `CallService.accept()` reads these back to join
+        // the room. Without this step, accept() has no token and the call
+        // connects silently with no media.
+        if let token = info.accessToken, let wsUrl = info.wsUrl,
+           !token.isEmpty, !wsUrl.isEmpty {
+            await stateStore.setCallCredentials(
+                CallMediaCredentials(accessToken: token, wsUrl: wsUrl),
+                for: info.callId
+            )
+            logger.debug("Incoming call \(info.callId): media credentials captured from push")
+        } else {
+            logger.warning("Incoming call \(info.callId): push carried no LiveKit credentials — accepting this call will not produce audio")
+        }
         
         await emitCallIncomingEvent(callInfo: callInfo, isSip: isSip)
         

@@ -234,6 +234,13 @@ extension LiveKitRoomManager: RoomDelegate {
         let identity = participant.identity?.stringValue ?? "unknown"
         Task { @MainActor in
             self.logger.info("LiveKit: remote participant joined: \(identity)")
+            logger.error("""
+            PARTICIPANT CONNECT
+
+            identity = \(participant.identity?.stringValue ?? "")
+            participants = \(room.remoteParticipants.count)
+            """)
+            
             await self.delegate?.roomManager(self, didReceiveEvent: .remoteParticipantJoined(identity: identity))
         }
     }
@@ -242,6 +249,12 @@ extension LiveKitRoomManager: RoomDelegate {
         let identity = participant.identity?.stringValue ?? "unknown"
         Task { @MainActor in
             self.logger.info("LiveKit: remote participant left: \(identity)")
+            logger.error("""
+            PARTICIPANT DISCONNECT
+
+            identity = \(participant.identity?.stringValue ?? "")
+            participants = \(room.remoteParticipants.count)
+            """)
             await self.delegate?.roomManager(self, didReceiveEvent: .remoteParticipantLeft(identity: identity))
         }
     }

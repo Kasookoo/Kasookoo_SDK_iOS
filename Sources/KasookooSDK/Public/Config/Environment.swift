@@ -30,13 +30,13 @@ public enum Environment: String, Sendable, Codable {
     public var baseURL: URL {
         switch self {
         case .production:
-            return URL(string: "https://sdk.kasookoo.ai")!
+            return URL(string: "https://sdk.kasookoo.dev")!
         case .staging:
             // TODO: Replace with actual staging URL when available from backend team
-            return URL(string: "https://sdk.kasookoo.ai")!
+            return URL(string: "https://sdk-test.kasookoo.ai")!
         case .development:
             // TODO: Replace with actual development URL when available from backend team
-            return URL(string: "https://sdk.kasookoo.ai")!
+            return URL(string: "https://sdk-test.kasookoo.ai")!
         }
     }
 }

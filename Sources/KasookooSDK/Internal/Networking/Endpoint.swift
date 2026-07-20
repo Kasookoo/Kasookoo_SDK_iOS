@@ -222,17 +222,16 @@ internal enum Endpoint: Sendable {
     // MARK: - Organization Context
     
     /// Whether this endpoint requires the `X-Organization-Id` header.
-    /// Most endpoints require it; auth endpoints typically don't because
-    /// the org context comes from the JWT after bootstrap.
+    ///
+    /// As of the current backend contract, protected routes read the tenant
+    /// `organization_id` from the SDK JWT (`get_organization_id`) — the explicit
+    /// `X-Organization-Id` header must NOT be sent. It is therefore disabled for
+    /// all endpoints. The switch is retained (rather than deleting the mechanism)
+    /// so it can be re-enabled per-endpoint if the backend ever requires it again.
     var requiresOrganizationHeader: Bool {
         switch self {
-        case .createClientSession,
-             .rotateSessionToken,
-             .revokeSession,
-             .introspectToken:
-            return false
         default:
-            return true
+            return false
         }
     }
     

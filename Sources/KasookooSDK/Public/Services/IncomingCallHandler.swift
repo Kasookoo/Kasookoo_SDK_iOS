@@ -71,9 +71,27 @@ public struct IncomingCallInfo: Sendable, Hashable {
     /// Whether this is a SIP call (from PSTN) or a WebRTC call.
     public let isSipCall: Bool
     
+    /// The LiveKit access token for joining the call's room.
+    ///
+    /// The backend delivers this inside the incoming-call push payload, because
+    /// the callee cannot request a token before answering. The SDK uses it to
+    /// join the room when the call is accepted.
+    public let accessToken: String?
+    
+    /// The LiveKit WebSocket URL for the call's room.
+    ///
+    /// Delivered alongside `accessToken` in the push payload.
+    public let wsUrl: String?
+    
     /// The display name shown on the CallKit screen.
     public var displayName: String {
         return caller.name.isEmpty ? caller.phoneNumber : caller.name
+    }
+    
+    /// Whether this call carries everything needed to join the media room.
+    public var hasMediaCredentials: Bool {
+        guard let token = accessToken, let url = wsUrl else { return false }
+        return !token.isEmpty && !url.isEmpty
     }
     
     public init(
@@ -81,12 +99,16 @@ public struct IncomingCallInfo: Sendable, Hashable {
         roomName: String,
         caller: Participant,
         callee: Participant,
-        isSipCall: Bool = false
+        isSipCall: Bool = false,
+        accessToken: String? = nil,
+        wsUrl: String? = nil
     ) {
         self.callId = callId
         self.roomName = roomName
         self.caller = caller
         self.callee = callee
         self.isSipCall = isSipCall
+        self.accessToken = accessToken
+        self.wsUrl = wsUrl
     }
 }

@@ -65,6 +65,9 @@ public enum EventName {
     /// Emitted when an outgoing SIP call is being placed.
     public static let sipCalling = "sip.calling"
     
+    /// A SIP call failed to initiate or was dropped abnormally.
+    public static let sipFailed = "sip.failed"
+    
     /// Emitted when a SIP call has been connected.
     public static let sipConnected = "sip.connected"
     
@@ -97,7 +100,7 @@ public enum EventName {
         sdkReady, sdkConnectionChanged, sdkError,
         sessionExpiring, sessionRefreshed, sessionExpired,
         callIncoming, callRinging, callConnected, callEnded, callFailed,
-        sipCalling, sipConnected, sipEnded,
+        sipCalling, sipConnected, sipEnded, sipFailed,
         messageReceived, messageSent, messageRead, conversationUpdated,
         notificationReceived
     ]

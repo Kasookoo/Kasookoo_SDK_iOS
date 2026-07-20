@@ -2,6 +2,8 @@
 //  ClientSessionDTOs.swift
 //  KasookooSDK
 //
+//  Data Transfer Objects for session-related endpoints.
+//  Schema verified against the live backend (POST /api/v1/sdk/auth/client-sessions).
 //
 
 import Foundation
@@ -78,16 +80,17 @@ internal struct CreateClientSessionResponse: Decodable, Sendable {
     /// The scopes the backend granted for this session.
     let allowedScopes: [String]?
     
-    enum CodingKeys: String, CodingKey {
-        case token
-        case accessToken = "access_token"
-        case tokenType = "token_type"
-        case sessionId = "session_id"
-        case expiresIn = "expires_in"
-        case audience
-        case issuer
-        case allowedScopes = "allowed_scopes"
-    }
+    // NOTE: No explicit CodingKeys here on purpose.
+    //
+    // The shared JSONDecoder uses `.convertFromSnakeCase`, which already maps
+    // `access_token` → `accessToken`, `session_id` → `sessionId`, etc. Providing
+    // explicit snake_case CodingKeys (e.g. `case sessionId = "session_id"`) on top
+    // of that strategy is a well-known Codable conflict: the strategy converts the
+    // JSON key to camelCase first, then fails to find a matching snake_case
+    // CodingKey — so the field silently decodes as nil. That is exactly what made
+    // `session_id` come back nil and forced a bogus UUID into the refresh URL.
+    // Letting the strategy do the mapping keeps this DTO consistent with the rest
+    // of the SDK's response models.
     
     /// Returns the effective access token, preferring `token` over `access_token`.
     var effectiveToken: String? {

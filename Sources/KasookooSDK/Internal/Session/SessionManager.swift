@@ -2,6 +2,13 @@
 //  SessionManager.swift
 //  KasookooSDK
 //
+//  Owns the session/token lifecycle (Section 6 of the spec).
+//
+//  This is the most critical class in the SDK:
+//  - Acquires sessions on connect()
+//  - Pre-emptively refreshes at 80-90% TTL
+//  - Handles 401/403 forced refreshes
+//  - Emits session.expiring, session.refreshed, session.expired events
 //
 
 import Foundation
@@ -223,7 +230,25 @@ internal actor SessionManager {
             )
         }
         
-        let sessionId = response.sessionId ?? fallbackSessionId ?? UUID().uuidString
+        // The session id MUST come from the backend (`session_id`, e.g.
+        // "sess_46954fbb..."). It is used to build the rotate/revoke URL:
+        //   POST /api/v1/sdk/auth/sessions/{session_id}/tokens
+        //
+        // Previously this fell back to `UUID().uuidString` when the backend id
+        // was missing — which produced a random UUID like
+        // "7AF6DD15-33D2-4C17-..." that the backend then rejected with
+        // 401 "Invalid SDK token" on the next refresh. We now prefer the
+        // response id, fall back to the known id from the prior token (on
+        // rotation the backend may omit it and expect the same session), and
+        // only fail loudly if neither exists — never invent a fake id.
+        guard let sessionId = response.sessionId ?? fallbackSessionId else {
+            throw KasookooError(
+                code: .sessionInvalid,
+                message: "Session response did not contain a session_id, and no existing session id was available. Cannot build refresh URL.",
+                retryable: false
+            )
+        }
+        
         let ttl = response.effectiveTTL
         
         return StoredToken(

@@ -61,10 +61,78 @@ public protocol CallServicing: Sendable {
     /// - Throws: `KasookooError` if the call cannot be ended.
     func end(callId: String) async throws
     
+    // MARK: - In-Call Audio Controls
+    
+    /// Mutes or unmutes the local microphone for an active call.
+    ///
+    /// - Parameters:
+    ///   - muted: `true` to mute (stop sending audio), `false` to unmute.
+    ///   - callId: The ID of the active call.
+    /// - Throws: `KasookooError.callFailed` if the call is unknown or not connected.
+    func setMuted(_ muted: Bool, callId: String) async throws
+    
+    /// Returns whether the local microphone is currently muted for a call.
+    ///
+    /// - Parameter callId: The ID of the active call.
+    /// - Returns: `true` if muted, `false` if unmuted or the call is unknown.
+    func isMuted(callId: String) async -> Bool
+    
+    /// Routes call audio to the loudspeaker or the earpiece.
+    ///
+    /// - Parameters:
+    ///   - enabled: `true` for loudspeaker, `false` for earpiece.
+    ///   - callId: The ID of the active call.
+    /// - Throws: `KasookooError.callFailed` if the call is unknown or audio routing fails.
+    func setSpeakerEnabled(_ enabled: Bool, callId: String) async throws
+    
     // MARK: - State
     
     /// Returns the currently active call, if any.
     ///
     /// - Returns: The active `CallInfo`, or nil if no call is active.
     func getActiveCall() async -> CallInfo?
+}
+
+// MARK: - Convenience: Active-Call Audio Controls
+
+public extension CallServicing {
+    
+    /// Mutes or unmutes the microphone for the currently active call.
+    ///
+    /// Convenience for the common single-call case. Resolves the active call
+    /// automatically. Does nothing if there is no active call.
+    ///
+    /// - Parameter muted: `true` to mute, `false` to unmute.
+    /// - Throws: `KasookooError.callFailed` if toggling fails.
+    func setMuted(_ muted: Bool) async throws {
+        guard let active = await getActiveCall() else {
+            throw KasookooError.callFailed(
+                message: "No active call to mute.",
+                retryable: false
+            )
+        }
+        try await setMuted(muted, callId: active.id)
+    }
+    
+    /// Whether the microphone is muted for the currently active call.
+    ///
+    /// - Returns: `true` if muted, `false` if unmuted or there is no active call.
+    func isMuted() async -> Bool {
+        guard let active = await getActiveCall() else { return false }
+        return await isMuted(callId: active.id)
+    }
+    
+    /// Routes audio to the loudspeaker or earpiece for the active call.
+    ///
+    /// - Parameter enabled: `true` for loudspeaker, `false` for earpiece.
+    /// - Throws: `KasookooError.callFailed` if routing fails.
+    func setSpeakerEnabled(_ enabled: Bool) async throws {
+        guard let active = await getActiveCall() else {
+            throw KasookooError.callFailed(
+                message: "No active call to route audio for.",
+                retryable: false
+            )
+        }
+        try await setSpeakerEnabled(enabled, callId: active.id)
+    }
 }

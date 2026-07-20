@@ -102,6 +102,7 @@ internal actor EventBus {
     /// Handlers run sequentially on this actor's executor; the public facade
     /// is responsible for hopping to MainActor before invoking consumer code.
     func emit(_ event: SDKEvent) {
+        print("Emitting SDKEvent '\(event.name)' (eventId: \(event.eventId))")
         logger.debug("Emitting '\(event.name)' (eventId: \(event.eventId))")
         
         // Notify Combine subscribers

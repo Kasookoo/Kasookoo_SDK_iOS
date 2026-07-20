@@ -45,6 +45,18 @@ internal actor StateStore {
     
     private var activeCalls: [String: CallInfo] = [:]
     
+    // MARK: - Call Media Credentials
+    
+    /// LiveKit media credentials for calls whose tokens arrive out-of-band.
+    ///
+    /// For **incoming** calls the backend delivers the LiveKit `accessToken` and
+    /// `wsUrl` inside the push notification payload — there is no separate token
+    /// endpoint to call. `NotificationService` stores them here when the push
+    /// arrives, and `CallService.accept()` reads them back to join the room.
+    ///
+    /// Keyed by callId. Cleared automatically when the call is removed.
+    private var callCredentials: [String: CallMediaCredentials] = [:]
+    
     // MARK: - Conversations Cache
     
     private var conversationsCache: [String: Conversation] = [:]
@@ -66,6 +78,7 @@ internal actor StateStore {
         let oldState = sdkState
         sdkState = newState
         logger.info("SDK state: \(oldState.description) → \(newState.description)")
+        print("SDK state: \(oldState.description) → \(newState.description)")
         return oldState
     }
     
@@ -160,10 +173,26 @@ internal actor StateStore {
         if activeCalls.removeValue(forKey: callId) != nil {
             logger.debug("Call removed: \(callId)")
         }
+        // Media credentials are scoped to the call's lifetime.
+        callCredentials.removeValue(forKey: callId)
     }
     
     func getCall(_ callId: String) -> CallInfo? {
         return activeCalls[callId]
+    }
+    
+    // MARK: - Call Media Credentials
+    
+    /// Stores the LiveKit credentials delivered with an incoming-call push,
+    /// so `CallService.accept()` can join the room later.
+    func setCallCredentials(_ credentials: CallMediaCredentials, for callId: String) {
+        callCredentials[callId] = credentials
+        logger.debug("Media credentials stored for call: \(callId)")
+    }
+    
+    /// Returns the LiveKit credentials for a call, if they were delivered via push.
+    func getCallCredentials(for callId: String) -> CallMediaCredentials? {
+        return callCredentials[callId]
     }
     
     func allActiveCalls() -> [CallInfo] {
@@ -207,5 +236,27 @@ internal actor StateStore {
         activeCalls.removeAll()
         conversationsCache.removeAll()
         logger.debug("StateStore reset")
+    }
+}
+
+// MARK: - Call Media Credentials
+
+/// LiveKit connection credentials for a call.
+///
+/// For **outgoing** calls these come from `POST /webrtc/get-call-tokens`.
+/// For **incoming** calls the backend embeds them directly in the push payload
+/// (`accessToken` + `wsUrl`), because the callee has no opportunity to request
+/// a token before answering.
+internal struct CallMediaCredentials: Sendable, Hashable {
+    
+    /// The LiveKit access token used to join the room.
+    let accessToken: String
+    
+    /// The LiveKit WebSocket URL.
+    let wsUrl: String
+    
+    init(accessToken: String, wsUrl: String) {
+        self.accessToken = accessToken
+        self.wsUrl = wsUrl
     }
 }

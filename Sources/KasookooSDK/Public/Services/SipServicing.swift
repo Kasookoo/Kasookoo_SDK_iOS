@@ -34,4 +34,22 @@ public protocol SipServicing: Sendable {
     /// - Parameter callId: The ID of the call.
     /// - Returns: The current `CallState`, or nil if the call is unknown.
     func getStatus(callId: String) async -> CallState?
+    
+    // MARK: - In-Call Audio Controls
+    
+    /// Mutes or unmutes the local microphone for an active SIP call.
+    ///
+    /// - Parameters:
+    ///   - muted: `true` to mute, `false` to unmute.
+    ///   - callId: The ID of the active SIP call.
+    /// - Throws: `KasookooError.callFailed` if the call is unknown or not connected.
+    func setMuted(_ muted: Bool, callId: String) async throws
+    
+    /// Routes SIP call audio to the loudspeaker or the earpiece.
+    ///
+    /// - Parameters:
+    ///   - enabled: `true` for loudspeaker, `false` for earpiece.
+    ///   - callId: The ID of the active SIP call.
+    /// - Throws: `KasookooError.callFailed` if the call is unknown or audio routing fails.
+    func setSpeakerEnabled(_ enabled: Bool, callId: String) async throws
 }

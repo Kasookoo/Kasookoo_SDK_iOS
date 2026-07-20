@@ -4,6 +4,14 @@
 //
 //
 
+//
+//  CallTokensDTOs.swift
+//  KasookooSDK
+//
+//  DTOs for /api/v1/webrtc/* and /api/v1/users/identify endpoints.
+//  Schema verified against Postman collection.
+//
+
 import Foundation
 
 // MARK: - Participant DTO (Internal Wire Format)
@@ -279,25 +287,64 @@ internal struct GetCallStatusResponse: Decodable, Sendable {
 ///
 /// **WARNING:** This endpoint uses **camelCase** field names, unlike most
 /// other endpoints which use snake_case. This is a backend quirk.
+/// Request body for `POST /api/v1/users/identify`.
+///
+/// Matches the backend contract (verified against the Postman collection):
+/// ```json
+/// { "organization_id": "...", "email": "...", "role": "customer" }
+/// ```
+///
+/// NOTE: The backend does NOT accept `name` / `phone_number` / `type` here —
+/// identify is a lightweight upsert keyed by (organization_id, email). The
+/// richer `CallerProfile` fields are still kept locally in the SDK's state and
+/// used when placing calls; they are simply not part of this request.
+///
+/// `organization_id` is taken from the SDK's own `KasookooConfig` — the host app
+/// does not pass it again.
 internal struct IdentifyUserRequest: Encodable, Sendable {
-    let name: String
+    let organizationId: String
     let email: String
-    let phoneNumber: String
-    let type: String
+    let role: String
     
-    // CamelCase — explicit CodingKeys to override JSONEncoder defaults
     enum CodingKeys: String, CodingKey {
-        case name
+        case organizationId = "organization_id"
         case email
-        case phoneNumber   // intentionally camelCase
-        case type
+        case role
     }
     
-    init(from profile: CallerProfile) {
-        self.name = profile.name
+    init(organizationId: String, profile: CallerProfile) {
+        self.organizationId = organizationId
         self.email = profile.email
-        self.phoneNumber = profile.phoneNumber
-        self.type = profile.type.rawValue
+        self.role = Self.identifyRole(for: profile.type)
+    }
+    
+    /// Maps a participant `type` onto the roles the `/users/identify` endpoint
+    /// accepts.
+    ///
+    /// ⚠️ TEMPORARY MAPPING. The identify endpoint currently only accepts
+    /// `customer`, `agent`, and `admin` — a narrower set than the participant
+    /// `type` used everywhere else (which also includes `driver`, `bot`, etc.).
+    /// Sending `driver` here returns a 422. Until the backend widens the accepted
+    /// identify roles, non-matching types are mapped to the closest valid role:
+    ///
+    ///   driver → agent   (per product decision)
+    ///
+    /// This mapping applies ONLY to identify. The call/messaging `type` fields
+    /// still send the real participant type (e.g. `driver`), which those
+    /// endpoints accept. Remove this once the backend accepts the full type set.
+    private static func identifyRole(for type: ParticipantType) -> String {
+        switch type {
+        case .customer:
+            return "customer"
+        case .agent:
+            return "agent"
+        case .driver:
+            return "agent"        // TODO: revert to "driver" once backend accepts it
+        case .bot, .system:
+            return "agent"        // service-side roles → agent
+        case .anonymous:
+            return "customer"     // treat anonymous as an end user
+        }
     }
 }
 
@@ -305,22 +352,26 @@ internal struct IdentifyUserRequest: Encodable, Sendable {
 ///
 /// **Confirm exact shape with backend team.**
 internal struct IdentifyUserResponse: Decodable, Sendable {
-    let success: Bool?
-    let userId: String?
     let id: String?
-    let email: String?
     let name: String?
-    
+    let email: String?
+    let phoneNumber: String?
+    let role: String?
+    let organizationId: String?
+    let created: Bool?
+
     enum CodingKeys: String, CodingKey {
-        case success
-        case userId = "user_id"
         case id
-        case email
         case name
+        case email
+        case phoneNumber = "phone_number"
+        case role
+        case organizationId = "organization_id"
+        case created
     }
     
     /// Returns the effective user ID, trying multiple field names.
     var effectiveUserId: String? {
-        return userId ?? id
+        return id
     }
 }

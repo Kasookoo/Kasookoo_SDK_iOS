@@ -63,6 +63,23 @@ public protocol NotificationServicing: Sendable {
         deviceInfo: DeviceInfo?
     ) async throws
     
+    /// Registers this device for push notifications, resolving the user
+    /// automatically from the identity established by `identify()`.
+    ///
+    /// Prefer this over the explicit-`userId` variant: the backend keys device
+    /// tokens by *its own* user id, which the host app has no way of knowing —
+    /// the SDK resolves it internally from the identified user's email.
+    ///
+    /// - Parameters:
+    ///   - fcmToken: The FCM registration token from Firebase.
+    ///   - deviceInfo: Optional device metadata. Defaults to the current device.
+    /// - Throws: `KasookooError.notIdentified` if `identify()` has not been called,
+    ///   or a network error if registration fails.
+    func registerDevice(
+        fcmToken: String,
+        deviceInfo: DeviceInfo?
+    ) async throws
+    
     /// Updates an FCM device token when Firebase rotates it.
     ///
     /// FCM may rotate tokens periodically. When your `MessagingDelegate` receives

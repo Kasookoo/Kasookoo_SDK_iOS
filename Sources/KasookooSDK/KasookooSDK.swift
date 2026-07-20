@@ -2,6 +2,11 @@
 //  KasookooSDK.swift
 //  KasookooSDK
 //
+//  The public entry point for the Kasookoo iOS SDK.
+//
+//  This class is the only type consumers need to import directly. All other
+//  public types (Participant, CallInfo, KasookooError, etc.) are reachable
+//  through this class or its service properties.
 //
 
 import Foundation
@@ -299,8 +304,13 @@ public final class KasookooSDK: @unchecked Sendable {
         try callerProfile.validate()
         let bundle = try requireAssembled()
         
-        // Send to backend
-        let request = IdentifyUserRequest(from: callerProfile)
+        // Send to backend. organization_id comes from the SDK's own config —
+        // the host app configured it once at initialize() and does not pass it
+        // again here.
+        let request = IdentifyUserRequest(
+            organizationId: bundle.config.organizationId,
+            profile: callerProfile
+        )
         let response = try await bundle.apiClient.send(
             endpoint: .identifyUser,
             body: request,

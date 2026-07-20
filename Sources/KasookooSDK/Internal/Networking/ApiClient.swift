@@ -2,7 +2,6 @@
 //  ApiClient.swift
 //  KasookooSDK
 //
-//
 
 import Foundation
 
@@ -128,6 +127,8 @@ internal final class ApiClient: @unchecked Sendable {
     ) async throws -> Response {
         
         let requestId = UUID().uuidString
+        
+        print("→ \(endpoint.method.rawValue) \(endpoint.path) [reqId: \(requestId)]")
         logger.debug("→ \(endpoint.method.rawValue) \(endpoint.path) [reqId: \(requestId)]")
         
         return try await Retrier.execute(
@@ -171,7 +172,7 @@ internal final class ApiClient: @unchecked Sendable {
             }
             authToken = try await provider.ensureValidToken()
         }
-        
+        print("→ \(endpoint.method.rawValue) \(endpoint.path) [Body \(body)] \n [Auth Token: \(authToken)] \n [reqId: \(requestId)]")
         // Build the request
         let urlRequest = try requestBuilder.build(
             endpoint: endpoint,
@@ -179,6 +180,8 @@ internal final class ApiClient: @unchecked Sendable {
             authToken: authToken,
             requestId: requestId
         )
+        
+        logRequest(urlRequest, endpoint: endpoint, requestId: requestId)
         
         // Execute the request
         let (data, response): (Data, URLResponse)
@@ -192,6 +195,8 @@ internal final class ApiClient: @unchecked Sendable {
             )
         }
         
+        logResponse(data, response: response, endpoint: endpoint, requestId: requestId)
+        
         // Try to decode the response
         do {
             let decoded = try responseDecoder.decode(
@@ -200,6 +205,7 @@ internal final class ApiClient: @unchecked Sendable {
                 response: response,
                 requestId: requestId
             )
+            print("← \(endpoint.path) success [reqId: \(requestId)]")
             logger.debug("← \(endpoint.path) success [reqId: \(requestId)]")
             return decoded
         } catch let error as KasookooError {
@@ -226,7 +232,12 @@ internal final class ApiClient: @unchecked Sendable {
                     requestId: requestId
                 )
                 
+                logRequest(retryRequest, endpoint: endpoint, requestId: requestId, isRetry: true)
+                
                 let (retryData, retryResponse) = try await session.data(for: retryRequest)
+                
+                logResponse(retryData, response: retryResponse, endpoint: endpoint, requestId: requestId, isRetry: true)
+                
                 return try responseDecoder.decode(
                     Response.self,
                     from: retryData,
@@ -238,6 +249,77 @@ internal final class ApiClient: @unchecked Sendable {
             // Not a 401 or no provider — rethrow
             throw error
         }
+    }
+    
+    // MARK: - Wire Logging (DEBUG builds only)
+    //
+    // Logs the full request and response bodies — invaluable when diagnosing
+    // backend contract mismatches.
+    //
+    // ⚠️ Compiled out of RELEASE builds on purpose: these bodies carry the
+    // publishable key, session JWTs, and LiveKit access tokens. Logging them in
+    // a shipped app would leak credentials into the device console.
+    
+    private func logRequest(
+        _ request: URLRequest,
+        endpoint: Endpoint,
+        requestId: String,
+        isRetry: Bool = false
+    ) {
+#if DEBUG
+        let tag = isRetry ? "↻ RETRY ➡️" : "➡️"
+        let method = endpoint.method.rawValue
+        let url = request.url?.absoluteString ?? endpoint.path
+        
+        var lines = ["\(tag) \(method) \(url) [reqId: \(requestId)]"]
+        
+        if let headers = request.allHTTPHeaderFields, !headers.isEmpty {
+            let rendered = headers
+                .map { "\($0.key): \(redactHeaderValue(key: $0.key, value: $0.value))" }
+                .sorted()
+                .joined(separator: "\n      ")
+            lines.append("   Headers:\n      \(rendered)")
+        }
+        
+        if let bodyData = request.httpBody,
+           let json = String(data: bodyData, encoding: .utf8),
+           !json.isEmpty {
+            lines.append("   Body: \(json)")
+        }
+        
+        logger.debug(lines.joined(separator: "\n"))
+        print(lines.joined(separator: "\n"))
+#endif
+    }
+    
+    private func logResponse(
+        _ data: Data,
+        response: URLResponse,
+        endpoint: Endpoint,
+        requestId: String,
+        isRetry: Bool = false
+    ) {
+#if DEBUG
+        let tag = isRetry ? "↻ RETRY ⬅️" : "⬅️"
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        let icon = (200..<300).contains(status) ? "✅" : "❌"
+        
+        let raw = String(data: data, encoding: .utf8)
+        ?? "<non-UTF8 body, \(data.count) bytes>"
+        let body = raw.isEmpty ? "<empty>" : raw
+        
+        logger.debug("\(tag) \(icon) \(status) \(endpoint.path) [reqId: \(requestId)]\n   Resp: \(body)")
+        print("Log Response \(tag) \(icon) \(status) \(endpoint.path) [reqId: \(requestId)]\n   Resp: \(body)")
+#endif
+    }
+    
+    /// Masks obviously sensitive header values so a shared debug log can't leak a
+    /// full bearer token. Bodies are still logged in full — DEBUG only.
+    private func redactHeaderValue(key: String, value: String) -> String {
+        let sensitive = ["authorization", "x-api-key", "cookie"]
+        guard sensitive.contains(key.lowercased()) else { return value }
+        guard value.count > 16 else { return "***" }
+        return "\(value.prefix(12))…\(value.suffix(4))"
     }
 }
 

@@ -172,13 +172,59 @@ internal actor CallService: CallServicing {
         
         logger.info("Accepting incoming call: \(callId)")
         
-        // For incoming calls, the call tokens should have been delivered via push.
-        // Here we transition state and trust that LiveKit connection happens via
-        // a separate flow (handled by NotificationService when push arrives).
-        // For now, we mark connecting and rely on remote participant join event.
+        // ─── Retrieve the LiveKit credentials delivered with the push ────────
+        //
+        // Unlike an outgoing call (which fetches tokens from /get-call-tokens),
+        // the callee receives the token inside the incoming-call push payload.
+        // NotificationService stored it when the push arrived. Without it we
+        // cannot join the room — the call would connect with no audio.
+        guard let credentials = await stateStore.getCallCredentials(for: callId) else {
+            let error = KasookooError.callFailed(
+                message: "Cannot accept call: no media credentials were delivered with the incoming-call push.",
+                retryable: false
+            )
+            await failCall(callId: callId, error: error)
+            throw error
+        }
         
-        let updated = try await transitionState(callId: callId, to: .connecting)
-        return updated ?? call
+        // Local identity: prefer the identified user, fall back to the callee
+        // profile that came with the push.
+        let identifiedEmail = await stateStore.currentUserEmail()
+        let calleeEmail: String? = call.callee.email.isEmpty ? nil : call.callee.email
+        let localIdentity = identifiedEmail ?? calleeEmail ?? call.callee.name
+        
+        do {
+            // ─── Join the LiveKit room (this is what produces audio) ─────────
+            let roomManager = await LiveKitRoomManager(logger: logger)
+            roomManagers[callId] = roomManager
+            await roomManager.setDelegate(self, callId: callId)
+            
+            try await roomManager.connect(
+                wsUrl: credentials.wsUrl,
+                token: credentials.accessToken,
+                roomName: call.roomName,
+                localIdentity: localIdentity
+            )
+            
+            logger.info("Incoming call \(callId): joined room '\(call.roomName)' as '\(localIdentity)'")
+            
+            // The call becomes `.connected` once the remote participant is seen
+            // (handled by handleLiveKitEvent), mirroring the outgoing flow.
+            let updated = try await transitionState(callId: callId, to: .connecting)
+            return updated ?? call
+            
+        } catch let sdkError as KasookooError {
+            await failCall(callId: callId, error: sdkError)
+            throw sdkError
+        } catch {
+            let wrapped = KasookooError.callFailed(
+                message: "Failed to join room for incoming call: \(error.localizedDescription)",
+                retryable: true,
+                underlyingError: error
+            )
+            await failCall(callId: callId, error: wrapped)
+            throw wrapped
+        }
     }
     
     // MARK: - CallServicing: reject
@@ -237,6 +283,10 @@ internal actor CallService: CallServicing {
     // MARK: - CallServicing: end
     
     func end(callId: String) async throws {
+        
+        Thread.callStackSymbols.forEach {
+            logger.error($0)
+        }
         guard let call = await stateStore.getCall(callId) else {
             logger.warning("end() called for unknown call: \(callId)")
             return // Silently succeed — call already gone
@@ -291,6 +341,40 @@ internal actor CallService: CallServicing {
         
         // Transition to ended
         try await transitionState(callId: callId, to: .ended)
+    }
+    
+    // MARK: - CallServicing: In-Call Audio Controls
+    
+    func setMuted(_ muted: Bool, callId: String) async throws {
+        guard let manager = roomManagers[callId] else {
+            throw KasookooError.callFailed(
+                message: "Cannot toggle mute for unknown or inactive call: \(callId)",
+                retryable: false
+            )
+        }
+        // LiveKit uses "microphone enabled" semantics; muted == mic disabled.
+        try await manager.setMicrophoneEnabled(!muted)
+        logger.info("Call \(callId) microphone \(muted ? "muted" : "unmuted")")
+    }
+    
+    func isMuted(callId: String) async -> Bool {
+        guard let manager = roomManagers[callId] else {
+            return false
+        }
+        // muted == microphone NOT enabled.
+        let micEnabled = await manager.isMicrophoneEnabled
+        return !micEnabled
+    }
+    
+    func setSpeakerEnabled(_ enabled: Bool, callId: String) async throws {
+        guard let manager = roomManagers[callId] else {
+            throw KasookooError.callFailed(
+                message: "Cannot toggle speaker for unknown or inactive call: \(callId)",
+                retryable: false
+            )
+        }
+        try await manager.setSpeakerEnabled(enabled)
+        logger.info("Call \(callId) speaker \(enabled ? "on" : "off")")
     }
     
     // MARK: - CallServicing: getActiveCall
@@ -436,17 +520,25 @@ internal actor CallService: CallServicing {
         switch event {
         case .remoteParticipantJoined:
             // Callee joined → call is now connected
+            logger.debug("REMOTE Participant joined -> CONNECT")
             try? await transitionState(callId: callId, to: .connected)
             
         case .remoteParticipantLeft:
             // Callee left → call ended on their side
             // Trigger our own end flow
+            logger.error("REMOTE LEFT -> END CALL")
             try? await end(callId: callId)
             
         case .roomConnected:
             logger.debug("Room connected for call \(callId)")
             
         case .roomDisconnected(let error):
+            logger.error("""
+            ROOM DISCONNECTED
+
+            error = \(String(describing: error))
+            """)
+            
             if let error = error {
                 logger.warning("Room disconnected with error: \(error.localizedDescription)")
                 let sdkError = KasookooError.callFailed(
