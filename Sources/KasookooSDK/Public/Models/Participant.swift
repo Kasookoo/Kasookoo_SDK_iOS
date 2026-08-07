@@ -94,9 +94,14 @@ public struct Participant: Sendable, Hashable, Codable {
             errors["email"] = "email is not in a valid format"
         }
         
-        if phoneNumber.trimmingCharacters(in: .whitespaces).isEmpty {
-            errors["phoneNumber"] = "phoneNumber cannot be empty"
-        }
+        // NOTE: phoneNumber is intentionally NOT required.
+        //
+        // The backend identifies participants by email; the phone number is
+        // informational for app-to-app (WebRTC) calls. Requiring it would also
+        // make the SDK reject its own data: an incoming-call push carries no
+        // phone numbers, so participants parsed from a push always have an empty
+        // one. For SIP the destination number is supplied separately via
+        // `SipDialParams.destinationNumber`, so nothing is lost here either.
         
         if !errors.isEmpty {
             throw KasookooError.configInvalid(

@@ -28,10 +28,21 @@ internal struct RequestBuilder: Sendable {
         self.organizationId = organizationId
         self.sdkVersion = sdkVersion
         
-        // IMPORTANT: We don't use convertToSnakeCase globally because the backend
-        // has inconsistent casing — most endpoints use snake_case, but
-        // /users/identify uses camelCase. Each DTO declares its own CodingKeys.
+        // Key strategy is symmetric with ResponseDecoder's
+        // `.convertFromSnakeCase`: every request body the backend accepts uses
+        // snake_case (`phone_number`, `room_name`, `publishable_key`, …), so the
+        // encoder converts automatically and DTOs don't declare CodingKeys.
+        //
+        // This previously had to be off because `/users/identify` took camelCase
+        // (`phoneNumber`); that endpoint now takes `{organization_id, email,
+        // role}` like everything else, so the exception is gone.
+        //
+        // Declaring explicit snake_case CodingKeys *and* enabling this strategy
+        // is the bug that silently broke decoding elsewhere (the strategy
+        // rewrites the key first, then the snake_case CodingKey no longer
+        // matches) — so DTOs should rely on the strategy, not fight it.
         let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
         encoder.dateEncodingStrategy = .iso8601
         self.encoder = encoder
     }
@@ -124,3 +135,95 @@ private struct EmptyBody: Encodable, Sendable {}
 internal enum SDKVersion {
     static let current = "0.1.0"
 }
+
+// MARK: - APIRequest support (ADDITIVE — Map §14, seam #2)
+//
+// Builds a URLRequest from an `APIRequest` descriptor instead of an `Endpoint`.
+// This runs alongside the `Endpoint`-based `build(...)` above; existing callers
+// are untouched. The only new capability is a per-request key strategy, which the
+// `Endpoint` path does not need (it always uses convertToSnakeCase).
+//
+// Same-file extension: intentional, so it can read RequestBuilder's private
+// stored properties (baseURL, publishableKey, organizationId, sdkVersion).
+
+extension RequestBuilder {
+
+    /// Builds a `URLRequest` for the given `APIRequest`.
+    ///
+    /// Behaviour matches the `Endpoint` overload (same headers, auth, timeout,
+    /// org-header rule) except the body encoder honours `apiRequest.keyStrategy`.
+    func build<Body: Encodable & Sendable>(
+        apiRequest: APIRequest,
+        body: Body?,
+        authToken: String? = nil,
+        requestId: String = UUID().uuidString
+    ) throws -> URLRequest {
+
+        // Construct URL from the resolved (query-inclusive) path.
+        guard let url = URL(string: apiRequest.resolvedPath, relativeTo: baseURL) else {
+            throw KasookooError.unknown(
+                message: "Failed to construct URL for request: \(apiRequest.resolvedPath)"
+            )
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = apiRequest.method.rawValue
+        request.timeoutInterval = apiRequest.timeout.seconds
+
+        // Standard headers — identical to the Endpoint path.
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("ios-swift/\(sdkVersion)", forHTTPHeaderField: "X-Kasookoo-SDK")
+        request.setValue(requestId, forHTTPHeaderField: "X-Request-Id")
+
+        if let token = authToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        if apiRequest.requiresOrgHeader {
+            request.setValue(organizationId, forHTTPHeaderField: "X-Organization-Id")
+        }
+
+        // Per-request body encoder — this is the one behaviour the Endpoint path
+        // can't express (it's locked to a single global strategy).
+        if let body = body {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            switch apiRequest.keyStrategy {
+            case .convertToSnakeCase:
+                encoder.keyEncodingStrategy = .convertToSnakeCase
+            case .useDefaultKeys:
+                encoder.keyEncodingStrategy = .useDefaultKeys
+            }
+
+            do {
+                request.httpBody = try encoder.encode(body)
+            } catch {
+                throw KasookooError.unknown(
+                    message: "Failed to encode request body: \(error.localizedDescription)",
+                    underlyingError: error
+                )
+            }
+        }
+
+        return request
+    }
+
+    /// Convenience overload for an `APIRequest` with no body.
+    func build(
+        apiRequest: APIRequest,
+        authToken: String? = nil,
+        requestId: String = UUID().uuidString
+    ) throws -> URLRequest {
+        return try build(
+            apiRequest: apiRequest,
+            body: Optional<APIRequestEmptyBody>.none,
+            authToken: authToken,
+            requestId: requestId
+        )
+    }
+}
+
+/// Empty body sentinel for `APIRequest` calls without a payload.
+/// (Separate name from the Endpoint path's private `EmptyBody` to avoid any clash.)
+private struct APIRequestEmptyBody: Encodable, Sendable {}

@@ -15,9 +15,15 @@ internal struct AssembledSDK {
     let apiClient: ApiClient
     let sessionManager: SessionManager
     let callService: CallService
-    let messagingService: MessagingService
     let sipService: SipService
     let notificationService: NotificationService
+
+    // Module registry infrastructure. Messaging runs on this today; the other
+    // services migrate onto it in later steps. Added once so the struct is not
+    // re-touched each migration.
+    let container: ServiceContainer
+    let moduleRegistry: SDKModuleRegistry
+    let pushRouter: PushRouter
 }
 
 /// Constructs the full SDK component graph.
@@ -92,14 +98,6 @@ internal enum SDKBuilder {
             config: config
         )
         
-        let messagingService = MessagingService(
-            apiClient: apiClient,
-            stateStore: stateStore,
-            eventBus: eventBus,
-            logger: logger,
-            config: config
-        )
-        
         let sipService = SipService(
             apiClient: apiClient,
             stateStore: stateStore,
@@ -123,6 +121,26 @@ internal enum SDKBuilder {
             sipService: sipService
         )
         
+        // ─────────────────────────────────────────────────────────────
+        // Module registry (messaging runs here today; other services later)
+        // ─────────────────────────────────────────────────────────────
+        
+        let container = ServiceContainer()
+        let pushRouter = PushRouter()
+        let moduleContext = ModuleContext(
+            config: config,
+            logger: logger,
+            eventBus: eventBus,
+            stateStore: stateStore,
+            apiClient: apiClient,
+            sessionManager: sessionManager,
+            registry: container
+        )
+        let moduleRegistry = SDKModuleRegistry(modules: [
+            MessagingModule()
+        ])
+        await moduleRegistry.configureAll(context: moduleContext, pushRouter: pushRouter)
+        
         logger.info("SDK build complete")
         
         return AssembledSDK(
@@ -133,9 +151,11 @@ internal enum SDKBuilder {
             apiClient: apiClient,
             sessionManager: sessionManager,
             callService: callService,
-            messagingService: messagingService,
             sipService: sipService,
-            notificationService: notificationService
+            notificationService: notificationService,
+            container: container,
+            moduleRegistry: moduleRegistry,
+            pushRouter: pushRouter
         )
     }
 }

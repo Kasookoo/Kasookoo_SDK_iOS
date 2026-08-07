@@ -2,12 +2,6 @@
 //  NotificationService.swift
 //  KasookooSDK
 //
-//
-
-//
-//  NotificationService.swift
-//  KasookooSDK
-//
 //  Implements NotificationServicing — FCM-based push notification management.
 //
 
@@ -396,6 +390,9 @@ internal actor NotificationService: NotificationServicing {
     // MARK: - Event Emission Helpers
     
     private func emitCallIncomingEvent(callInfo: CallInfo, isSip: Bool) async {
+        // Everything the host app needs to present an incoming-call screen.
+        // Note the callee/type fields: without them a host app cannot tell which
+        // of its own users the call is for, nor render the caller's role.
         let event = SDKEvent(
             name: EventName.callIncoming,
             organizationId: config.organizationId,
@@ -406,6 +403,10 @@ internal actor NotificationService: NotificationServicing {
                 "callerEmail": .string(callInfo.caller.email),
                 "callerName": .string(callInfo.caller.name),
                 "callerPhoneNumber": .string(callInfo.caller.phoneNumber),
+                "callerType": .string(callInfo.caller.type.rawValue),
+                "calleeEmail": .string(callInfo.callee.email),
+                "calleeName": .string(callInfo.callee.name),
+                "calleeType": .string(callInfo.callee.type.rawValue),
                 "isSipCall": .bool(isSip)
             ]
         )

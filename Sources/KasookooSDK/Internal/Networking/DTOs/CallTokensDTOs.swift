@@ -2,12 +2,6 @@
 //  CallTokensDTOs.swift
 //  KasookooSDK
 //
-//
-
-//
-//  CallTokensDTOs.swift
-//  KasookooSDK
-//
 //  DTOs for /api/v1/webrtc/* and /api/v1/users/identify endpoints.
 //  Schema verified against Postman collection.
 //
@@ -24,12 +18,6 @@ internal struct ParticipantDTO: Codable, Sendable {
     let phoneNumber: String
     let type: String
     
-    enum CodingKeys: String, CodingKey {
-        case name
-        case email
-        case phoneNumber = "phone_number"
-        case type
-    }
     
     /// Creates a DTO from a public Participant model.
     init(from participant: Participant) {
@@ -82,14 +70,6 @@ internal struct GetCallTokensRequest: Encodable, Sendable {
     let isPushNotification: Bool
     let isCallRecording: Bool
     
-    enum CodingKeys: String, CodingKey {
-        case roomName = "room_name"
-        case caller
-        case callee
-        case deviceType = "device_type"
-        case isPushNotification = "is_push_notification"
-        case isCallRecording = "is_call_recording"
-    }
 }
 
 /// Response body for `POST /api/v1/webrtc/get-call-tokens`.
@@ -120,9 +100,16 @@ internal struct GetCallTokensResponse: Decodable, Sendable {
     /// LiveKit access token for the callee (if applicable — older shape).
     let calleeToken: String?
     
-    /// LiveKit WebSocket URL (real backend field: `wsUrl`).
+    /// LiveKit WebSocket URL (real backend field: `ws_url`).
     let wsUrl: String?
-    
+
+    /// LiveKit HTTP URL (real backend field: `http_url`).
+    let httpUrl: String?
+
+    /// How the callee receives its own token: `push` when delivered via FCM,
+    /// otherwise `none`. Backend field: `callee_token_delivery`.
+    let calleeTokenDelivery: String?
+
     /// Alternative LiveKit URL field name (older shape).
     let livekitUrl: String?
     
@@ -132,17 +119,6 @@ internal struct GetCallTokensResponse: Decodable, Sendable {
     /// A unique identifier for this call (if returned).
     let callId: String?
     
-    enum CodingKeys: String, CodingKey {
-        // Real backend uses camelCase
-        case accessToken
-        case wsUrl
-        // Legacy/fallback snake_case keys (kept for safety)
-        case callerToken = "caller_token"
-        case calleeToken = "callee_token"
-        case livekitUrl = "livekit_url"
-        case roomName = "room_name"
-        case callId = "call_id"
-    }
     
     /// Returns the effective caller token, preferring `accessToken` over
     /// the legacy `caller_token`.
@@ -181,15 +157,6 @@ internal struct GetCallTokensAnonymousRequest: Encodable, Sendable {
     let isPushNotification: Bool
     let isCallRecording: Bool
     
-    enum CodingKeys: String, CodingKey {
-        case roomName = "room_name"
-        case participantIdentity = "participant_identity"
-        case participantIdentityName = "participant_identity_name"
-        case calledUserId = "called_user_id"
-        case deviceType = "device_type"
-        case isPushNotification = "is_push_notification"
-        case isCallRecording = "is_call_recording"
-    }
 }
 
 /// Response shape identical to authenticated version.
@@ -204,11 +171,6 @@ internal struct EndCallResponse: Decodable, Sendable {
     let endedAt: String?
     let message: String?
     
-    enum CodingKeys: String, CodingKey {
-        case success
-        case endedAt = "ended_at"
-        case message
-    }
 }
 
 // MARK: - Caller End Call
@@ -218,39 +180,22 @@ internal struct EndCallResponse: Decodable, Sendable {
 /// Used when the caller hangs up their own call (before or during connection).
 internal struct CallerEndCallRequest: Encodable, Sendable {
     let roomName: String
-    let participantIdentity: String
-    let participantIdentityType: String  // typically "caller"
-    let callerUserId: String
-    let calledUserId: String
+    let caller: ParticipantDTO
+    let callee: ParticipantDTO
     
-    enum CodingKeys: String, CodingKey {
-        case roomName = "room_name"
-        case participantIdentity = "participant_identity"
-        case participantIdentityType = "participant_identity_type"
-        case callerUserId = "caller_user_id"
-        case calledUserId = "called_user_id"
-    }
 }
 
 // MARK: - Reject Call
 
 /// Request body for `POST /api/v1/webrtc/calls/reject`.
+///
+/// Same shape as caller-end: the backend identifies both parties by their
+/// participant objects (email-keyed), not by user ids.
 internal struct RejectCallRequest: Encodable, Sendable {
     let roomName: String
-    let participantIdentity: String
-    let participantIdentityName: String
-    let participantIdentityType: String
-    let callerUserId: String
-    let calledUserId: String
+    let caller: ParticipantDTO
+    let callee: ParticipantDTO
     
-    enum CodingKeys: String, CodingKey {
-        case roomName = "room_name"
-        case participantIdentity = "participant_identity"
-        case participantIdentityName = "participant_identity_name"
-        case participantIdentityType = "participant_identity_type"
-        case callerUserId = "caller_user_id"
-        case calledUserId = "called_user_id"
-    }
 }
 
 // MARK: - Get Call Status
@@ -263,13 +208,6 @@ internal struct GetCallStatusResponse: Decodable, Sendable {
     let startedAt: String?
     let durationSeconds: Int?
     
-    enum CodingKeys: String, CodingKey {
-        case roomName = "room_name"
-        case status
-        case participantCount = "participant_count"
-        case startedAt = "started_at"
-        case durationSeconds = "duration_seconds"
-    }
 }
 
 // MARK: - Identify User
@@ -306,11 +244,6 @@ internal struct IdentifyUserRequest: Encodable, Sendable {
     let email: String
     let role: String
     
-    enum CodingKeys: String, CodingKey {
-        case organizationId = "organization_id"
-        case email
-        case role
-    }
     
     init(organizationId: String, profile: CallerProfile) {
         self.organizationId = organizationId
@@ -350,28 +283,32 @@ internal struct IdentifyUserRequest: Encodable, Sendable {
 
 /// Response for `POST /api/v1/users/identify`.
 ///
-/// **Confirm exact shape with backend team.**
+/// Verified shape:
+/// ```json
+/// { "id": "...", "email": "...", "phone_number": null,
+///   "first_name": "...", "last_name": "...", "role": "agent",
+///   "organization_id": "...", "caller_id": null,
+///   "customer_id": null, "customer_name": "...",
+///   "provisioning_source": null }
+/// ```
 internal struct IdentifyUserResponse: Decodable, Sendable {
     let id: String?
-    let name: String?
     let email: String?
     let phoneNumber: String?
+    let firstName: String?
+    let lastName: String?
     let role: String?
     let organizationId: String?
-    let created: Bool?
+    let callerId: String?
+    let customerId: String?
+    let customerName: String?
+    let provisioningSource: String?
 
-    enum CodingKeys: String, CodingKey {
-        case id
-        case name
-        case email
-        case phoneNumber = "phone_number"
-        case role
-        case organizationId = "organization_id"
-        case created
-    }
-    
-    /// Returns the effective user ID, trying multiple field names.
+    /// Legacy field name kept as a fallback for older responses.
+    let userId: String?
+
+    /// Returns the effective user id, preferring `id` over the legacy `user_id`.
     var effectiveUserId: String? {
-        return id
+        return id ?? userId
     }
 }

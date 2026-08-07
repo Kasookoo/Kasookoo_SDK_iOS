@@ -61,40 +61,10 @@ internal enum Endpoint: Sendable {
     
     /// `POST /api/v1/sip/calls/make` — Initiate outbound SIP call (preferred for new calls).
     case sipMakeCall
-    
-    /// `POST /api/v1/sip/calls/dial` — Alternative outbound SIP dial endpoint.
-    case sipDial
-    
+        
     /// `POST /api/v1/sip/calls/end` — End SIP call (graceful).
     case sipEndCall
-    
-    /// `POST /api/v1/sip/calls/hangup` — Hang up SIP call (force).
-    case sipHangup
-    
-    // MARK: - Messaging
-    
-    /// `POST /api/v1/messaging/get-token` — Get messaging token.
-    case messagingGetToken
-    
-    /// `POST /api/v1/messaging/send` — Send a message.
-    /// **Note:** Uses sender_user_id / receiver_user_id (not emails).
-    case messagingSend
-    
-    /// `GET /api/v1/messaging/conversations` — List conversations.
-    /// Query params: skip, limit
-    case messagingListConversations(skip: Int, limit: Int)
-    
-    /// `GET /api/v1/messaging/conversations/{conversation_id}/messages` — Get messages.
-    /// Query params: skip, limit
-    /// **Note:** Uses conversation_id (not room_name).
-    case messagingGetMessages(conversationId: String, skip: Int, limit: Int)
-    
-    /// `POST /api/v1/messaging/mark-read` — Mark messages as read.
-    case messagingMarkRead
-    
-    /// `GET /api/v1/messaging/unread-count` — Total unread count.
-    case messagingUnreadCount
-    
+        
     // MARK: - Notifications (FCM-based)
     
     /// `POST /api/v1/notifications/register-token` — Register FCM device token.
@@ -144,39 +114,8 @@ internal enum Endpoint: Sendable {
         // SIP
         case .sipMakeCall:
             return "/api/v1/sip/calls/make"
-        case .sipDial:
-            return "/api/v1/sip/calls/dial"
         case .sipEndCall:
             return "/api/v1/sip/calls/end"
-        case .sipHangup:
-            return "/api/v1/sip/calls/hangup"
-            
-        // Messaging
-        case .messagingGetToken:
-            return "/api/v1/messaging/get-token"
-        case .messagingSend:
-            return "/api/v1/messaging/send"
-        case .messagingListConversations(let skip, let limit):
-            var components = URLComponents()
-            components.path = "/api/v1/messaging/conversations"
-            components.queryItems = [
-                URLQueryItem(name: "skip", value: "\(skip)"),
-                URLQueryItem(name: "limit", value: "\(limit)")
-            ]
-            return components.string ?? "/api/v1/messaging/conversations"
-        case .messagingGetMessages(let conversationId, let skip, let limit):
-            let encoded = conversationId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? conversationId
-            var components = URLComponents()
-            components.path = "/api/v1/messaging/conversations/\(encoded)/messages"
-            components.queryItems = [
-                URLQueryItem(name: "skip", value: "\(skip)"),
-                URLQueryItem(name: "limit", value: "\(limit)")
-            ]
-            return components.string ?? "/api/v1/messaging/conversations/\(encoded)/messages"
-        case .messagingMarkRead:
-            return "/api/v1/messaging/mark-read"
-        case .messagingUnreadCount:
-            return "/api/v1/messaging/unread-count"
             
         // Notifications
         case .registerDeviceToken:
@@ -196,9 +135,6 @@ internal enum Endpoint: Sendable {
         case .revokeSession:
             return .delete
         case .introspectToken,
-             .messagingListConversations,
-             .messagingGetMessages,
-             .messagingUnreadCount,
              .getCallStatus:
             return .get
         default:
@@ -252,17 +188,8 @@ internal enum Endpoint: Sendable {
              .getCallStatus,
              .rejectCall,
              .sipMakeCall,
-             .sipDial,
-             .sipEndCall,
-             .sipHangup:
+             .sipEndCall:
             return .call
-        case .messagingGetToken,
-             .messagingSend,
-             .messagingListConversations,
-             .messagingGetMessages,
-             .messagingMarkRead,
-             .messagingUnreadCount:
-            return .messaging
         case .identifyUser,
              .registerDeviceToken,
              .updateDeviceToken,

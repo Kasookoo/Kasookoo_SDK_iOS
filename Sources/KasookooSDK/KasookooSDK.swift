@@ -303,33 +303,45 @@ public final class KasookooSDK: @unchecked Sendable {
     public func identify(callerProfile: CallerProfile) async throws {
         try callerProfile.validate()
         let bundle = try requireAssembled()
-        
-        // Send to backend. organization_id comes from the SDK's own config —
-        // the host app configured it once at initialize() and does not pass it
-        // again here.
+
+        // The `organization_id` sent here MUST match the organization the session
+        // was authenticated for (the backend returns 403 otherwise). The
+        // authoritative source is the session JWT itself, so we read it from the
+        // token rather than trusting a host-app configured value, falling back to
+        // the configured value only if the token can't be parsed.
+        let token = try await bundle.sessionManager.ensureValidToken()
+        let orgId = Self.organizationId(fromJWT: token) ?? bundle.config.organizationId
+
         let request = IdentifyUserRequest(
-            organizationId: bundle.config.organizationId,
+            organizationId: orgId,
             profile: callerProfile
         )
+
+        // On an unregistered user the backend returns HTTP 404 "not_found", which the
+        // response decoder maps to `KasookooError.userNotFound`, so this call throws
+        // before any identity is set. The app can catch `.userNotFound` to prompt
+        // registration.
         let response = try await bundle.apiClient.send(
             endpoint: .identifyUser,
             body: request,
             responseType: IdentifyUserResponse.self,
             retryPolicy: .default
         )
-        
-        // Update local state with user_id from response.
-        // This caches email → user_id so subsequent messaging.send() can resolve emails.
-        let userId = response.effectiveUserId
-        await bundle.stateStore.setIdentifiedUser(callerProfile, userId: userId)
-        
-        if let userId = userId {
-            bundle.logger.info("User identified: \(callerProfile.email) [userId: \(userId)]")
-        } else {
-            bundle.logger.warning("User identified but backend did not return user_id: \(callerProfile.email)")
+
+        // A successful response with no user_id would leave the SDK in a half
+        // identified state that messaging and calling cannot use, so fail cleanly
+        // instead of caching an identity without an id.
+        guard let userId = response.effectiveUserId else {
+            bundle.logger.warning("Identify returned no user_id for \(callerProfile.email)")
+            throw KasookooError.userNotFound(
+                message: "Identify did not return a user id for \(callerProfile.email). The user may not be registered with this organization."
+            )
         }
+
+        // Cache email → user_id so subsequent messaging.send() can resolve emails.
+        await bundle.stateStore.setIdentifiedUser(callerProfile, userId: userId)
+        bundle.logger.info("User identified: \(callerProfile.email) [userId: \(userId)]")
     }
-    
     /// Clears the identified user.
     ///
     /// The SDK reverts to guest-mode behavior. Does not revoke the session;
@@ -369,9 +381,11 @@ public final class KasookooSDK: @unchecked Sendable {
     }
     
     /// The messaging service. Use for in-app messaging.
+    /// Resolved from the module service container (messaging runs on the module
+    /// registry); other services still come from `AssembledSDK` for now.
     public var messaging: MessagingServicing {
         get throws {
-            try requireAssembled().messagingService
+            try requireAssembled().container.resolve(MessagingServicing.self)
         }
     }
     
@@ -474,5 +488,36 @@ public final class KasookooSDK: @unchecked Sendable {
             data: data
         )
         await bundle.eventBus.emit(event)
+    }
+    
+    // MARK: - JWT Helpers
+    
+    /// Extracts the `organization_id` claim from a session JWT.
+    ///
+    /// The token is a standard JWT: `header.payload.signature`, each segment
+    /// base64url-encoded. We decode only the payload (no signature verification —
+    /// the backend already verified it when issuing; we just need the claim). This
+    /// lets `identify` send exactly the org the session was authenticated for,
+    /// avoiding the 403 mismatch.
+    ///
+    /// Returns nil if the token is malformed or has no `organization_id` claim.
+    static func organizationId(fromJWT token: String) -> String? {
+        let segments = token.split(separator: ".")
+        guard segments.count >= 2 else { return nil }
+        
+        var base64 = String(segments[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        // Pad to a multiple of 4 for base64 decoding.
+        while base64.count % 4 != 0 { base64 += "=" }
+        
+        guard let data = Data(base64Encoded: base64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let orgId = json["organization_id"] as? String,
+              !orgId.isEmpty
+        else {
+            return nil
+        }
+        return orgId
     }
 }

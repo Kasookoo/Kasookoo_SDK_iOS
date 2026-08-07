@@ -55,7 +55,14 @@ public struct Message: Sendable, Hashable, Identifiable {
     
     /// Whether the local user is the sender of this message.
     public let isOutgoing: Bool
-    
+
+    /// The conversation this message belongs to, when known. Optional.
+    public let conversationId: String?
+
+    /// Arbitrary metadata attached to the message, such as location coordinates.
+    /// Optional.
+    public let metadata: [String: String]?
+
     // MARK: - Init
     
     public init(
@@ -70,7 +77,9 @@ public struct Message: Sendable, Hashable, Identifiable {
         deliveredAt: Date? = nil,
         readAt: Date? = nil,
         status: MessageStatus = .sending,
-        isOutgoing: Bool = true
+        isOutgoing: Bool = true,
+        conversationId: String? = nil,
+        metadata: [String: String]? = nil
     ) {
         self.id = id
         self.roomName = roomName
@@ -84,6 +93,8 @@ public struct Message: Sendable, Hashable, Identifiable {
         self.readAt = readAt
         self.status = status
         self.isOutgoing = isOutgoing
+        self.conversationId = conversationId
+        self.metadata = metadata
     }
 }
 
@@ -96,6 +107,7 @@ public enum MessageType: String, Sendable, Hashable, Codable {
     case file = "file"
     case audio = "audio"
     case video = "video"
+    case location = "location"
     case system = "system"
 }
 

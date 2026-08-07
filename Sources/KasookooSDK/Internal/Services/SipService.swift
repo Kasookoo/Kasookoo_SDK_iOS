@@ -2,7 +2,6 @@
 //  SipService.swift
 //  KasookooSDK
 //
-//
 //  Implements SipServicing — aligned with real backend.
 //
 //  SIP call flow (mirrors CallService's proven WebRTC pattern):
@@ -47,6 +46,13 @@ internal actor SipService: SipServicing {
         let participantIdentity: String
     }
     private var sipCallContexts: [String: SipCallContext] = [:]
+    
+    /// Calls whose hangup is currently in flight.
+    ///
+    /// Prevents the teardown race described in `hangup(callId:)` — our own room
+    /// disconnect triggers `remoteParticipantLeft`, which would otherwise issue
+    /// a second hangup before the first has finished.
+    private var endingSipCallIds: Set<String> = []
     
     // MARK: - Init
     
@@ -213,9 +219,9 @@ internal actor SipService: SipServicing {
         }
     }
     
-    // MARK: - SipServicing: hangup
+    // MARK: - SipServicing: endCall
     
-    func hangup(callId: String) async throws {
+    func endCall(callId: String) async throws {
         guard let context = sipCallContexts[callId] else {
             logger.warning("hangup: unknown SIP callId \(callId)")
             throw KasookooError.callFailed(
@@ -223,6 +229,21 @@ internal actor SipService: SipServicing {
                 retryable: false
             )
         }
+        
+        // Guard against a second hangup racing the first.
+        //
+        // Tearing down the LiveKit room makes the PSTN bridge look like it left,
+        // which fires `remoteParticipantLeft` → another hangup. A state check
+        // isn't enough: the first hangup is still awaiting its API call when the
+        // second arrives, so the state hasn't changed yet. Tracking in-flight
+        // ids closes that window — otherwise the backend receives two hangups
+        // and answers the loser with "Failed to end call".
+        guard !endingSipCallIds.contains(callId) else {
+            logger.debug("hangup already in flight for \(callId) — ignoring duplicate")
+            return
+        }
+        endingSipCallIds.insert(callId)
+        defer { endingSipCallIds.remove(callId) }
         
         logger.info("Hanging up SIP call: \(callId)")
         
@@ -233,20 +254,22 @@ internal actor SipService: SipServicing {
         }
         
         // Notify the backend to end the PSTN leg.
-        let request = SipHangupRequest(
+        let request = SipEndCallRequest(
             participantIdentity: context.participantIdentity,
             roomName: context.roomName
         )
         
         do {
+            // The backend removed the dedicated hangup endpoint; end and hangup
+            // were duplicates, so we now call the end endpoint with the same body.
             _ = try await apiClient.send(
-                endpoint: .sipHangup,
+                endpoint: .sipEndCall,
                 body: request,
                 responseType: SipEndResponse.self,
                 retryPolicy: .default
             )
         } catch {
-            logger.warning("SIP hangup API failed: \(error.localizedDescription) — cleaning up locally anyway")
+            logger.warning("SIP end API failed: \(error.localizedDescription) — cleaning up locally anyway")
         }
         
         // Update state → ended.
@@ -308,6 +331,18 @@ internal actor SipService: SipServicing {
         logger.info("SIP call \(callId) speaker \(enabled ? "on" : "off")")
     }
     
+    // MARK: - DTMF
+    
+    func sendDTMF(_ digit: String, callId: String) async throws {
+        guard let manager = roomManagers[callId] else {
+            throw KasookooError.callFailed(
+                message: "Cannot send DTMF for unknown or inactive SIP call: \(callId)",
+                retryable: false
+            )
+        }
+        try await manager.sendDTMF(digit)
+    }
+    
     // MARK: - Private: Failure Handling
     
     private func failSipCall(callId: String, error: KasookooError) async {
@@ -367,8 +402,19 @@ internal actor SipService: SipServicing {
             logger.info("SIP call connected (PSTN bridge joined): \(callId)")
             
         case .remoteParticipantLeft:
-            // The PSTN side hung up → end our side too.
-            try? await hangup(callId: callId)
+            // The PSTN bridge left the room → end our side too.
+            //
+            // This also fires when WE hang up (our own teardown disconnects the
+            // room), so guard on state to keep the handler idempotent — otherwise
+            // hangup() runs twice and the second one errors on an already-ended
+            // call.
+            if let call = await stateStore.getCall(callId),
+               !call.state.isTerminal,
+               call.state != .ending {
+                try? await endCall(callId: callId)
+            } else {
+                logger.debug("PSTN bridge left for SIP call \(callId) — already ending/ended, ignoring")
+            }
             
         case .roomConnected:
             logger.debug("SIP room connected for call \(callId)")

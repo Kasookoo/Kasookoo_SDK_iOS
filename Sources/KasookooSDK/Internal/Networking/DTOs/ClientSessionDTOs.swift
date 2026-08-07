@@ -79,6 +79,14 @@ internal struct CreateClientSessionResponse: Decodable, Sendable {
     
     /// The scopes the backend granted for this session.
     let allowedScopes: [String]?
+
+    /// The organization this session belongs to (`organization_id`).
+    let organizationId: String?
+
+    /// Per organization capability map (`configuration_availability`). Present on
+    /// both session creation and refresh. Optional so older or partial responses
+    /// still decode. Used to enable features per organization (Map §13.2).
+    let configurationAvailability: ConfigurationAvailability?
     
     // NOTE: No explicit CodingKeys here on purpose.
     //

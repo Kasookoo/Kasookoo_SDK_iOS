@@ -23,38 +23,35 @@ internal struct SipMakeCallRequest: Encodable, Sendable {
     let roomName: String
     let participantName: String
     
-    enum CodingKeys: String, CodingKey {
-        case phoneNumber = "phone_number"
-        case roomName = "room_name"
-        case participantName = "participant_name"
-    }
 }
 
-/// Response for `POST .../sdk-sip/calls/make`.
+/// Response for `POST /api/v1/sip/calls/make` on the SDK backend.
 ///
 /// Real backend shape (verified against live response):
 /// ```json
-/// {
-///   "success": true,
-///   "message": "Call initiated successfully",
-///   "data": {
-///     "success": true,
-///     "call_details": {
-///       "participant_identity": "68feddf6cc0ae9923d3609a3",
-///       "room_name": "sdk-room",
-///       "phone_number": "966966"
-///     },
-///     "room_token": "eyJhbGc...",
-///     "room_name": "sdk-room",
-///     "room_session_id": "RM_k82hgrbMJdLP",
-///     "phone_number": "966966",
-///     "participant_identity": "68feddf6cc0ae9923d3609a3",
-///     "status": "waiting_for_webrtc",
-///     "wsUrl": "wss://inapp-test.kasookoo.ai"
-///   },
-///   "wsUrl": "wss://inapp-test.kasookoo.ai",
-///   "error": null
-/// }
+//{
+//    "success": true,
+//    "message": "Call initiated successfully",
+//    "data": {
+//        "success": true,
+//        "call_details": {
+//            "participant_identity": "webrtc-user-1785444414",
+//            "room_name": "sip_call_123",
+//            "dialed_number": "+923190835238",
+//            "caller_id": "+442070786177"
+//        },
+//        "room_name": "sip_call_123",
+//        "room_session_id": "RM_rRiF5kCCfFsA",
+//        "dialed_number": "+923190835238",
+//        "caller_id": "+442070786177",
+//        "participant_identity": "webrtc-user-1785444414",
+//        "status": "waiting_for_webrtc",
+//        "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoiSm9obiBEb2UiLCJraW5kIjoidXNlciIsInZpZGVvIjp7InJvb21Kb2luIjp0cnVlLCJyb29tIjoic2lwX2NhbGxfMTIzIiwiY2FuUHVibGlzaCI6dHJ1ZSwiY2FuU3Vic2NyaWJlIjp0cnVlLCJjYW5QdWJsaXNoRGF0YSI6dHJ1ZX0sInN1YiI6IndlYnJ0Yy11c2VyLTE3ODU0NDQ0MTQiLCJpc3MiOiJBUElEbmZKajY3Z2hGVVkiLCJuYmYiOjE3ODU0NDQ0MTQsImV4cCI6MTc4NTQ2NjAxNH0.tUXd9b0bb-CxR4Xhv6SEaB90sBcvPpoNs1CRwhWCjAU",
+//        "ws_url": "wss://inapp-test.kasookoo.ai",
+//        "http_url": "https://inapp-test.kasookoo.ai"
+//    },
+//    "error": null
+//}
 /// ```
 ///
 /// The critical media fields for the SDK are `data.room_token` + `data.wsUrl`,
@@ -63,77 +60,50 @@ internal struct SipMakeCallResponse: Decodable, Sendable {
     let success: Bool?
     let message: String?
     let data: SipMakeCallData?
-    /// Top-level `wsUrl` duplicate (backend currently sends it in both places).
-    let wsUrlTopLevel: String?
     let error: SipErrorPayload?
-    
-    enum CodingKeys: String, CodingKey {
-        case success
-        case message
-        case data
-        case wsUrlTopLevel = "wsUrl"
-        case error
-    }
-    
+
     // MARK: - Convenience Accessors
-    //
-    // These shield the rest of the SDK from the backend's duplicated/mixed-case
-    // fields. If the contract is cleaned up later, only these accessors change.
-    
-    /// The LiveKit access token used to join the room. Nil if the call failed.
+
+    /// LiveKit access token for the local leg. Nil if the call failed.
     var effectiveRoomToken: String? {
-        data?.roomToken
+        data?.accessToken
     }
-    
-    /// The LiveKit WebSocket URL.
-    ///
-    /// ⚠️ The backend sends `wsUrl` in **two** places with **different schemes**:
-    ///   - `data.wsUrl`  → "https://inapp.kasookoo.ai"  (WRONG — LiveKit cannot use http/https)
-    ///   - top-level     → "wss://inapp.kasookoo.ai"    (CORRECT)
-    ///
-    /// LiveKit requires a `ws://` or `wss://` URL. We therefore prefer whichever
-    /// candidate already has a WebSocket scheme, and only fall back to coercing
-    /// an http(s) URL if no proper one was supplied. Verified against a live
-    /// `POST /api/v1/sip/calls/make` response.
+
+    /// LiveKit WebSocket URL. The backend now returns a correct `wss://` value.
     var effectiveWsUrl: String? {
-        let candidates = [wsUrlTopLevel, data?.wsUrl].compactMap { $0 }
-        
-        // 1. Prefer a candidate that is already a WebSocket URL.
-        if let wsNative = candidates.first(where: {
-            $0.hasPrefix("wss://") || $0.hasPrefix("ws://")
-        }) {
-            return wsNative
-        }
-        
-        // 2. Otherwise coerce an http(s) URL into its WebSocket equivalent.
-        if let httpUrl = candidates.first {
-            if httpUrl.hasPrefix("https://") {
-                return "wss://" + httpUrl.dropFirst("https://".count)
-            }
-            if httpUrl.hasPrefix("http://") {
-                return "ws://" + httpUrl.dropFirst("http://".count)
-            }
-            return httpUrl
-        }
-        
-        return nil
+        data?.wsUrl
     }
-    
+
+    /// LiveKit HTTP URL (`https://`).
+    var effectiveHttpUrl: String? {
+        data?.httpUrl
+    }
+
     /// The room the SIP call is bridged into.
     var effectiveRoomName: String? {
         data?.roomName ?? data?.callDetails?.roomName
     }
-    
-    /// A stable identifier for this SIP call (used for hangup/status).
+
+    /// A stable identifier for this SIP call (used for end/status).
     var effectiveCallId: String? {
         data?.roomSessionId
     }
-    
-    /// The participant identity assigned by the backend for the local leg.
+
+    /// The participant identity for the local leg.
     var effectiveParticipantIdentity: String? {
         data?.participantIdentity ?? data?.callDetails?.participantIdentity
     }
-    
+
+    /// The number actually dialled.
+    var effectiveDialedNumber: String? {
+        data?.dialedNumber ?? data?.callDetails?.dialedNumber
+    }
+
+    /// The caller id shown to the callee.
+    var effectiveCallerId: String? {
+        data?.callerId ?? data?.callDetails?.callerId
+    }
+
     /// The backend-reported status, e.g. "waiting_for_webrtc".
     var effectiveStatus: String? {
         data?.status
@@ -144,38 +114,24 @@ internal struct SipMakeCallResponse: Decodable, Sendable {
 internal struct SipMakeCallData: Decodable, Sendable {
     let success: Bool?
     let callDetails: SipCallDetails?
-    let roomToken: String?
     let roomName: String?
     let roomSessionId: String?
-    let phoneNumber: String?
+    let dialedNumber: String?
+    let callerId: String?
     let participantIdentity: String?
     let status: String?
+    /// LiveKit access token for the local leg (`access_token`).
+    let accessToken: String?
     let wsUrl: String?
-    
-    enum CodingKeys: String, CodingKey {
-        case success
-        case callDetails = "call_details"
-        case roomToken = "room_token"
-        case roomName = "room_name"
-        case roomSessionId = "room_session_id"
-        case phoneNumber = "phone_number"
-        case participantIdentity = "participant_identity"
-        case status
-        case wsUrl = "wsUrl"   // NOTE: backend sends this camelCase; all else is snake_case.
-    }
+    let httpUrl: String?
 }
 
 /// The `call_details` sub-object.
 internal struct SipCallDetails: Decodable, Sendable {
     let participantIdentity: String?
     let roomName: String?
-    let phoneNumber: String?
-    
-    enum CodingKeys: String, CodingKey {
-        case participantIdentity = "participant_identity"
-        case roomName = "room_name"
-        case phoneNumber = "phone_number"
-    }
+    let dialedNumber: String?
+    let callerId: String?
 }
 
 /// Error payload shape for SIP responses (best-effort; backend `error` is null on success).
@@ -184,13 +140,6 @@ internal struct SipErrorPayload: Decodable, Sendable {
     let message: String?
 }
 
-// MARK: - SIP Dial
-
-/// Request body for `POST /api/v1/sip/calls/dial`.
-/// Same shape as make-call per Postman.
-internal typealias SipDialRequest = SipMakeCallRequest
-internal typealias SipDialResponse = SipMakeCallResponse
-
 // MARK: - SIP End Call (Graceful)
 
 /// Request body for `POST /api/v1/sip/calls/end`.
@@ -198,23 +147,6 @@ internal struct SipEndCallRequest: Encodable, Sendable {
     let participantIdentity: String
     let roomName: String
     
-    enum CodingKeys: String, CodingKey {
-        case participantIdentity = "participant_identity"
-        case roomName = "room_name"
-    }
-}
-
-// MARK: - SIP Hangup (Force)
-
-/// Request body for `POST /api/v1/sip/calls/hangup`.
-internal struct SipHangupRequest: Encodable, Sendable {
-    let participantIdentity: String
-    let roomName: String
-    
-    enum CodingKeys: String, CodingKey {
-        case participantIdentity = "participant_identity"
-        case roomName = "room_name"
-    }
 }
 
 /// Response for SIP end/hangup endpoints.
@@ -223,9 +155,4 @@ internal struct SipEndResponse: Decodable, Sendable {
     let endedAt: String?
     let message: String?
     
-    enum CodingKeys: String, CodingKey {
-        case success
-        case endedAt = "ended_at"
-        case message
-    }
 }

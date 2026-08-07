@@ -167,6 +167,24 @@ extension KasookooError {
         )
     }
     
+    /// Creates a `not_found` (user not found) error.
+    ///
+    /// Produced when `identify` is called for a user that is not registered with
+    /// the organization: the backend returns HTTP 404 with `code: "not_found"`.
+    /// The app should register or provision the user before identifying again.
+    public static func userNotFound(
+        message: String = "User not found.",
+        details: [String: String]? = nil
+    ) -> KasookooError {
+        return KasookooError(
+            code: .userNotFound,
+            message: message,
+            retryable: false,
+            httpStatus: 404,
+            details: details
+        )
+    }
+    
     // MARK: Network
     
     /// Creates a `NETWORK_UNAVAILABLE` error wrapping an underlying error.

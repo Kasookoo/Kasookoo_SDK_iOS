@@ -38,6 +38,10 @@ public enum ErrorCode: String, Sendable, Codable {
     /// The current session does not have permission to perform this action.
     case permissionDenied = "PERMISSION_DENIED"
     
+    case unauthorized = "unauthorized"
+    
+    case userNotFound = "not_found"
+    
     // MARK: - Network Errors
     
     /// The network is unavailable or the request timed out.

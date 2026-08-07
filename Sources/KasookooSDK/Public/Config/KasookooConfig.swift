@@ -37,7 +37,7 @@ public struct KasookooConfig: Sendable {
     public let organizationId: String
     
     /// The deployment environment (production, staging, development).
-    public let environment: Environment
+    public let environment: KasookooEnvironment
     
     // MARK: - Optional Fields
     
@@ -82,7 +82,7 @@ public struct KasookooConfig: Sendable {
     public init(
         publishableKey: String,
         organizationId: String,
-        environment: Environment,
+        environment: KasookooEnvironment,
         region: String? = nil,
         userMode: UserMode = .guest,
         features: FeatureFlags = .default,

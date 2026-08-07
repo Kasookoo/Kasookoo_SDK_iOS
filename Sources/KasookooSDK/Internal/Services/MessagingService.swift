@@ -71,17 +71,17 @@ internal actor MessagingService: MessagingServicing {
         )
         
         let response = try await apiClient.send(
-            endpoint: .messagingGetToken,
+            apiRequest: MessagingRequests.getToken,
             body: request,
             responseType: GetMessagingTokenResponse.self,
             retryPolicy: .default
         )
         
-        // Cache the token for later sends
-        if let token = response.effectiveToken,
-           let roomName = response.roomName {
-            roomTokens[roomName] = token
-            logger.debug("Messaging token cached for room: \(roomName)")
+        // Cache the token for later sends. The token response does not echo the
+        // room name, so key the cache by the room we requested.
+        if let token = response.effectiveToken {
+            roomTokens[params.roomName] = token
+            logger.debug("Messaging token cached for room: \(params.roomName)")
         }
     }
     
@@ -129,6 +129,7 @@ internal actor MessagingService: MessagingServicing {
             receiverUserId: receiverUserId,
             roomName: params.roomName,
             message: params.message,
+            channel: "normal",
             messageType: params.messageType.rawValue,
             metadata: params.metadata,
             isPushNotification: params.isPushNotification
@@ -139,7 +140,7 @@ internal actor MessagingService: MessagingServicing {
         let response: SendMessageResponse
         do {
             response = try await apiClient.send(
-                endpoint: .messagingSend,
+                apiRequest: MessagingRequests.send,
                 body: request,
                 responseType: SendMessageResponse.self,
                 retryPolicy: .default
@@ -180,7 +181,9 @@ internal actor MessagingService: MessagingServicing {
             mediaURL: nil,
             sentAt: sentDate,
             status: statusEnum,
-            isOutgoing: true
+            isOutgoing: true,
+            conversationId: response.conversationId,
+            metadata: params.metadata
         )
         
         // Emit success event
@@ -204,13 +207,19 @@ internal actor MessagingService: MessagingServicing {
             )
         }
         
+        guard let currentUserId = await stateStore.currentUserId else {
+            throw KasookooError.messageSendFailed(
+                message: "UserId is not available.",
+                retryable: false
+            )
+        }
+        
         let response = try await apiClient.send(
-            endpoint: .messagingListConversations(skip: filters.skip, limit: filters.limit),
+            apiRequest: MessagingRequests.listConversations(userId: currentUserId, skip: filters.skip, limit: filters.limit),
             responseType: ListConversationsResponse.self,
             retryPolicy: .default
         )
         
-        let currentUserId = await stateStore.currentUserId
         let conversationDTOs = response.effectiveConversations
         let conversations = conversationDTOs.map { $0.toModel(currentUserId: currentUserId) }
         
@@ -256,9 +265,16 @@ internal actor MessagingService: MessagingServicing {
             throw KasookooError.configInvalid("conversationId cannot be empty")
         }
         
+        guard let currentUserId = await stateStore.currentUserId else {
+            throw KasookooError.messageSendFailed(
+                message: "UserId is not available.",
+                retryable: false
+            )
+        }
+        
         let response = try await apiClient.send(
-            endpoint: .messagingGetMessages(
-                conversationId: conversationId,
+            apiRequest: MessagingRequests.getMessages(
+                userId: currentUserId, conversationId: conversationId,
                 skip: paging.skip,
                 limit: paging.limit
             ),
@@ -266,7 +282,6 @@ internal actor MessagingService: MessagingServicing {
             retryPolicy: .default
         )
         
-        let currentUserId = await stateStore.currentUserId
         let messages = response.effectiveMessages.map { $0.toModel(currentUserId: currentUserId) }
         
         return PaginatedResult(
@@ -292,14 +307,21 @@ internal actor MessagingService: MessagingServicing {
         }
         
         logger.debug("Marking conversation as read: \(conversationId)")
+
+        guard let currentUserId = await stateStore.currentUserId else {
+            throw KasookooError.configInvalid(
+                "Cannot mark messages as read without an identified user. Call identify() first."
+            )
+        }
         
         let request = MarkReadRequest(
+            userId: currentUserId,
             conversationId: conversationId,
             messageIds: messageIds
         )
         
         let response = try await apiClient.send(
-            endpoint: .messagingMarkRead,
+            apiRequest: MessagingRequests.markRead,
             body: request,
             responseType: MarkReadResponse.self,
             retryPolicy: .default
@@ -312,7 +334,7 @@ internal actor MessagingService: MessagingServicing {
             userEmail: await stateStore.currentUserEmail(),
             data: [
                 "conversationId": .string(conversationId),
-                "markedCount": .int(response.markedCount ?? 0)
+                "markedCount": .int(response.messagesMarkedRead ?? 0)
             ]
         )
         await eventBus.emit(event)
@@ -326,7 +348,7 @@ internal actor MessagingService: MessagingServicing {
         }
         
         let response = try await apiClient.send(
-            endpoint: .messagingUnreadCount,
+            apiRequest: MessagingRequests.unreadCount,
             responseType: UnreadCountResponse.self,
             retryPolicy: .default
         )

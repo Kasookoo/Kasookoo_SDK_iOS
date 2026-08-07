@@ -2,6 +2,8 @@
 //  LiveKitRoomManager.swift
 //  KasookooSDK
 //
+//  Wraps the LiveKit SDK for room/call management.
+//  All LiveKit-specific logic lives here so the rest of the SDK doesn't depend on it.
 //
 
 import Foundation
@@ -179,6 +181,56 @@ internal final class LiveKitRoomManager: NSObject {
         }
     }
     
+    // MARK: - DTMF
+    
+    /// Sends a DTMF tone to the remote (PSTN) side of a SIP call.
+    ///
+    /// Tones are published on the LiveKit data channel under the `dtmf` topic,
+    /// which is what the backend's SIP bridge listens on. Required for IVR
+    /// navigation ("press 1 for sales") on PSTN calls.
+    ///
+    /// - Parameter digit: A single character: `0`–`9`, `*`, or `#`.
+    /// - Throws: `KasookooError.callFailed` if the digit is invalid or publishing fails.
+    func sendDTMF(_ digit: String) async throws {
+        guard let code = Self.dtmfCode(for: digit) else {
+            throw KasookooError.callFailed(
+                message: "Invalid DTMF digit '\(digit)'. Expected 0-9, * or #.",
+                retryable: false
+            )
+        }
+        
+        let message: [String: String] = ["code": code, "digit": digit]
+        guard let data = try? JSONSerialization.data(withJSONObject: message) else {
+            throw KasookooError.callFailed(
+                message: "Failed to encode DTMF payload.",
+                retryable: false
+            )
+        }
+        
+        do {
+            let options = DataPublishOptions(topic: "dtmf", reliable: true)
+            try await room.localParticipant.publish(data: data, options: options)
+            logger.debug("DTMF sent: \(digit) (code \(code))")
+        } catch {
+            throw KasookooError.callFailed(
+                message: "Failed to send DTMF: \(error.localizedDescription)",
+                retryable: true,
+                underlyingError: error
+            )
+        }
+    }
+    
+    /// Maps a DTMF character to the numeric code the SIP bridge expects.
+    private static func dtmfCode(for digit: String) -> String? {
+        switch digit {
+        case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9":
+            return digit
+        case "*": return "10"
+        case "#": return "11"
+        default:  return nil
+        }
+    }
+    
     // MARK: - Audio Session Setup
     
     private func configureAudioSession() throws {
@@ -234,13 +286,6 @@ extension LiveKitRoomManager: RoomDelegate {
         let identity = participant.identity?.stringValue ?? "unknown"
         Task { @MainActor in
             self.logger.info("LiveKit: remote participant joined: \(identity)")
-            logger.error("""
-            PARTICIPANT CONNECT
-
-            identity = \(participant.identity?.stringValue ?? "")
-            participants = \(room.remoteParticipants.count)
-            """)
-            
             await self.delegate?.roomManager(self, didReceiveEvent: .remoteParticipantJoined(identity: identity))
         }
     }
@@ -249,12 +294,6 @@ extension LiveKitRoomManager: RoomDelegate {
         let identity = participant.identity?.stringValue ?? "unknown"
         Task { @MainActor in
             self.logger.info("LiveKit: remote participant left: \(identity)")
-            logger.error("""
-            PARTICIPANT DISCONNECT
-
-            identity = \(participant.identity?.stringValue ?? "")
-            participants = \(room.remoteParticipants.count)
-            """)
             await self.delegate?.roomManager(self, didReceiveEvent: .remoteParticipantLeft(identity: identity))
         }
     }

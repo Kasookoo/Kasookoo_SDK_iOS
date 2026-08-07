@@ -3,7 +3,7 @@
 //  KasookooSDK
 //
 //  Public protocol for SIP calling.
-//  Section 4: sip.dial, sip.hangup, sip.getStatus
+//  Section 4: sip.dial, sip.endCall, sip.getStatus
 //
 
 import Foundation
@@ -23,11 +23,11 @@ public protocol SipServicing: Sendable {
     @discardableResult
     func dial(params: SipDialParams) async throws -> CallInfo
     
-    /// Hangs up an active SIP call.
+    /// Ends an active SIP call.
     ///
-    /// - Parameter callId: The ID of the call to hang up.
+    /// - Parameter callId: The ID of the call to end.
     /// - Throws: `KasookooError` if the call cannot be ended.
-    func hangup(callId: String) async throws
+    func endCall(callId: String) async throws
     
     /// Returns the current state of a SIP call.
     ///
@@ -52,4 +52,16 @@ public protocol SipServicing: Sendable {
     ///   - callId: The ID of the active SIP call.
     /// - Throws: `KasookooError.callFailed` if the call is unknown or audio routing fails.
     func setSpeakerEnabled(_ enabled: Bool, callId: String) async throws
+    
+    // MARK: - DTMF
+    
+    /// Sends a DTMF tone on an active SIP call.
+    ///
+    /// Needed to navigate IVR menus on PSTN calls ("press 1 for sales").
+    ///
+    /// - Parameters:
+    ///   - digit: A single character: `0`–`9`, `*`, or `#`.
+    ///   - callId: The ID of the active SIP call.
+    /// - Throws: `KasookooError.callFailed` if the call is unknown or the digit is invalid.
+    func sendDTMF(_ digit: String, callId: String) async throws
 }

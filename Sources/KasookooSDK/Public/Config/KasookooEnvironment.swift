@@ -1,5 +1,5 @@
 //
-//  Environment.swift
+//  KasookooEnvironment.swift
 //  KasookooSDK
 //
 //  Defines the deployment environment for the SDK.
@@ -10,7 +10,14 @@ import Foundation
 /// The deployment environment for the SDK.
 ///
 /// Determines which backend URL the SDK will connect to.
-public enum Environment: String, Sendable, Codable {
+///
+/// - Note: Named `KasookooEnvironment` rather than `Environment` on purpose.
+///   SwiftUI ships an `Environment` property wrapper that virtually every iOS
+///   app uses (`@Environment(\.dismiss)`, `@Environment(\.colorScheme)`, …). A
+///   public type called `Environment` here would collide with it in any file
+///   that imports both, forcing consumers to write `@SwiftUI.Environment`
+///   everywhere. Prefixing keeps the SDK a good citizen in host apps.
+public enum KasookooEnvironment: String, Sendable, Codable {
     
     /// Production environment. Live user traffic.
     case production = "production"
@@ -24,18 +31,15 @@ public enum Environment: String, Sendable, Codable {
     // MARK: - Backend URLs
     
     /// The base URL for this environment.
-    ///
-    /// **Current state:** All three point to the same backend until separate
-    /// staging/dev environments are confirmed with the backend team.
     public var baseURL: URL {
         switch self {
         case .production:
-            return URL(string: "https://sdk.kasookoo.dev")!
+            return URL(string: "https://sdk.kasookoo.ai")!
         case .staging:
-            // TODO: Replace with actual staging URL when available from backend team
             return URL(string: "https://sdk-test.kasookoo.ai")!
         case .development:
-            // TODO: Replace with actual development URL when available from backend team
+            // TODO: Replace with the actual development URL when the backend
+            // team confirms one. Falls back to staging so dev builds still work.
             return URL(string: "https://sdk-test.kasookoo.ai")!
         }
     }

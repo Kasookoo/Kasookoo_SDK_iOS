@@ -128,7 +128,6 @@ internal final class ApiClient: @unchecked Sendable {
         
         let requestId = UUID().uuidString
         
-        print("→ \(endpoint.method.rawValue) \(endpoint.path) [reqId: \(requestId)]")
         logger.debug("→ \(endpoint.method.rawValue) \(endpoint.path) [reqId: \(requestId)]")
         
         return try await Retrier.execute(
@@ -238,6 +237,15 @@ internal final class ApiClient: @unchecked Sendable {
                 
                 logResponse(retryData, response: retryResponse, endpoint: endpoint, requestId: requestId, isRetry: true)
                 
+                if let http = retryResponse as? HTTPURLResponse, http.statusCode == 401 {
+                    throw KasookooError(
+                        code: .unauthorized,
+                        message: "Authentication failed after refreshing the session.",
+                        retryable: false,
+                        httpStatus: 401
+                    )
+                }
+                
                 return try responseDecoder.decode(
                     Response.self,
                     from: retryData,
@@ -326,3 +334,185 @@ internal final class ApiClient: @unchecked Sendable {
 // MARK: - Empty Body Helper
 
 private struct EmptyBody: Encodable, Sendable {}
+
+// MARK: - APIRequest support (ADDITIVE — Map §14, seam #2)
+//
+// New send(...) methods that take an `APIRequest` descriptor instead of an
+// `Endpoint`. These mirror the Endpoint-based methods above exactly — same auth
+// flow, same one-time 401 refresh, same retry policy — and reuse RequestBuilder /
+// ResponseDecoder / the auth provider.
+//
+// Same-file extension so it can reach ApiClient's private members (session,
+// requestBuilder, responseDecoder, logger, currentAuthProvider()).
+//
+// TRANSITIONAL: services still call the Endpoint methods. As each migrates to
+// APIRequest, its calls move here. When the last one moves, the Endpoint methods
+// (and the enum) are deleted and this becomes the only path — no logic is
+// duplicated permanently, only during the migration window (Map §14.7).
+
+extension ApiClient {
+
+    /// Sends an `APIRequest` with an `Encodable` body and decodes the response.
+    func send<Body: Encodable & Sendable, Response: Decodable & Sendable>(
+        apiRequest: APIRequest,
+        body: Body,
+        responseType: Response.Type,
+        retryPolicy: RetryPolicy = .default
+    ) async throws -> Response {
+        return try await performRequest(
+            apiRequest: apiRequest,
+            body: body,
+            responseType: Response.self,
+            retryPolicy: retryPolicy
+        )
+    }
+
+    /// Sends an `APIRequest` without a body and decodes the response.
+    func send<Response: Decodable & Sendable>(
+        apiRequest: APIRequest,
+        responseType: Response.Type,
+        retryPolicy: RetryPolicy = .default
+    ) async throws -> Response {
+        return try await performRequest(
+            apiRequest: apiRequest,
+            body: Optional<APIRequestEmptyBodyAC>.none,
+            responseType: Response.self,
+            retryPolicy: retryPolicy
+        )
+    }
+
+    /// Sends an `APIRequest` that returns no decoded body (status-only).
+    func sendVoid(
+        apiRequest: APIRequest,
+        retryPolicy: RetryPolicy = .default
+    ) async throws {
+        _ = try await performRequest(
+            apiRequest: apiRequest,
+            body: Optional<APIRequestEmptyBodyAC>.none,
+            responseType: EmptyResponse.self,
+            retryPolicy: retryPolicy
+        )
+    }
+
+    // MARK: - Core (APIRequest)
+
+    private func performRequest<Body: Encodable & Sendable, Response: Decodable & Sendable>(
+        apiRequest: APIRequest,
+        body: Body?,
+        responseType: Response.Type,
+        retryPolicy: RetryPolicy
+    ) async throws -> Response {
+
+        let requestId = UUID().uuidString
+        logger.debug("→ \(apiRequest.method.rawValue) \(apiRequest.resolvedPath) [reqId: \(requestId)]")
+
+        return try await Retrier.execute(
+            policy: retryPolicy,
+            isRetryable: { error in
+                guard let sdkError = error as? KasookooError else { return false }
+                if sdkError.code == .permissionDenied { return false }
+                return sdkError.retryable
+            }
+        ) { [weak self] in
+            guard let self = self else {
+                throw KasookooError.unknown(message: "ApiClient was deallocated.")
+            }
+            return try await self.executeOnce(
+                apiRequest: apiRequest,
+                body: body,
+                responseType: Response.self,
+                requestId: requestId
+            )
+        }
+    }
+
+    /// One request attempt with a single auto-refresh on 401 — mirrors the
+    /// Endpoint-based `executeOnce`.
+    private func executeOnce<Body: Encodable & Sendable, Response: Decodable & Sendable>(
+        apiRequest: APIRequest,
+        body: Body?,
+        responseType: Response.Type,
+        requestId: String
+    ) async throws -> Response {
+
+        // Auth token if needed.
+        var authToken: String?
+        if apiRequest.requiresAuth {
+            guard let provider = currentAuthProvider() else {
+                throw KasookooError(
+                    code: .sessionInvalid,
+                    message: "Auth provider not configured. Did you call connect()?",
+                    retryable: false
+                )
+            }
+            authToken = try await provider.ensureValidToken()
+        }
+
+        let urlRequest = try requestBuilder.build(
+            apiRequest: apiRequest,
+            body: body,
+            authToken: authToken,
+            requestId: requestId
+        )
+
+        // Execute.
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: urlRequest)
+        } catch {
+            logger.warning("Network error on \(apiRequest.resolvedPath): \(error.localizedDescription)")
+            throw KasookooError.networkUnavailable(
+                message: "Network request failed: \(error.localizedDescription)",
+                underlyingError: error
+            )
+        }
+
+        // Decode.
+        do {
+            let decoded = try responseDecoder.decode(
+                Response.self,
+                from: data,
+                response: response,
+                requestId: requestId
+            )
+            logger.debug("← \(apiRequest.resolvedPath) success [reqId: \(requestId)]")
+            return decoded
+        } catch let error as KasookooError {
+            // 401: refresh once and retry.
+            if error.code == .sessionExpired,
+               apiRequest.requiresAuth,
+               let provider = currentAuthProvider() {
+                logger.info("Got 401 on \(apiRequest.resolvedPath), attempting one-time session refresh")
+
+                let newToken: String
+                do {
+                    newToken = try await provider.forceRefresh()
+                } catch {
+                    logger.warning("Session refresh failed: \(error.localizedDescription)")
+                    throw error
+                }
+
+                let retryRequest = try requestBuilder.build(
+                    apiRequest: apiRequest,
+                    body: body,
+                    authToken: newToken,
+                    requestId: requestId
+                )
+
+                let (retryData, retryResponse) = try await session.data(for: retryRequest)
+
+                return try responseDecoder.decode(
+                    Response.self,
+                    from: retryData,
+                    response: retryResponse,
+                    requestId: requestId
+                )
+            }
+            throw error
+        }
+    }
+}
+
+/// Empty body sentinel for the APIRequest path (separate name to avoid clashing
+/// with the file's private `EmptyBody`).
+private struct APIRequestEmptyBodyAC: Encodable, Sendable {}

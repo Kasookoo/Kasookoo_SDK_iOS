@@ -26,6 +26,12 @@ internal actor CallService: CallServicing {
     /// Multi-call support: user can have multiple calls (one active, others on hold).
     private var roomManagers: [String: LiveKitRoomManager] = [:]
     
+    /// Calls whose teardown is currently in flight.
+    ///
+    /// See the guard in `end(callId:)` — prevents duplicate end requests when
+    /// the UI (or our own room teardown) triggers the path twice.
+    private var endingCallIds: Set<String> = []
+    
     // MARK: - Init
     
     init(
@@ -246,20 +252,14 @@ internal actor CallService: CallServicing {
         
         logger.info("Rejecting call \(callId), reason: \(reason.rawValue)")
         
-        // Resolve user IDs for the reject request.
-        // Real backend expects caller_user_id and called_user_id.
-        let calleeUserId = await stateStore.resolveUserId(from: call.callee.userReference)
-            ?? call.callee.email  // Fallback to email as identity
-        let callerUserId = await stateStore.resolveUserId(from: call.caller.userReference)
-            ?? call.caller.email
-        
+        // The backend identifies both parties by participant objects (email-keyed),
+        // not by user ids. Sending ids here previously caused a 500
+        // ("not a valid ObjectId") whenever the id could not be resolved and the
+        // email was used as a fallback.
         let request = RejectCallRequest(
             roomName: call.roomName,
-            participantIdentity: call.callee.email,
-            participantIdentityName: call.callee.name,
-            participantIdentityType: call.callee.type.rawValue,
-            callerUserId: callerUserId,
-            calledUserId: calleeUserId
+            caller: ParticipantDTO(from: call.caller),
+            callee: ParticipantDTO(from: call.callee)
         )
         
         // Notify backend of the rejection (dedicated reject endpoint)
@@ -283,14 +283,24 @@ internal actor CallService: CallServicing {
     // MARK: - CallServicing: end
     
     func end(callId: String) async throws {
-        
-        Thread.callStackSymbols.forEach {
-            logger.error($0)
-        }
         guard let call = await stateStore.getCall(callId) else {
             logger.warning("end() called for unknown call: \(callId)")
             return // Silently succeed — call already gone
         }
+        
+        // Guard against a second end() racing the first.
+        //
+        // UIs commonly call this from more than one place (a hang-up button and
+        // a teardown handler, say), and disconnecting the room can itself
+        // trigger a "remote left" path that ends the call again. The first call
+        // is still awaiting its API request when the second arrives, so a state
+        // check alone doesn't catch it — hence tracking in-flight ids.
+        guard !endingCallIds.contains(callId) else {
+            logger.debug("end() already in flight for \(callId) — ignoring duplicate")
+            return
+        }
+        endingCallIds.insert(callId)
+        defer { endingCallIds.remove(callId) }
         
         logger.info("Ending call: \(callId) (direction: \(call.direction.rawValue))")
         
@@ -308,18 +318,14 @@ internal actor CallService: CallServicing {
         // - Incoming call ended after pickup → /webrtc/calls/{room}/end
         do {
             if call.direction == .outgoing {
-                // Caller ending their own call
-                let callerUserId = await stateStore.resolveUserId(from: call.caller.userReference)
-                    ?? call.caller.email
-                let calledUserId = await stateStore.resolveUserId(from: call.callee.userReference)
-                    ?? call.callee.email
-                
+                // Caller ending their own call. The backend expects full
+                // participant objects for both parties (see Postman collection);
+                // the older flat `caller_user_id` / `called_user_id` shape now
+                // returns 422 "Field required: caller / callee".
                 let request = CallerEndCallRequest(
                     roomName: call.roomName,
-                    participantIdentity: call.caller.email,
-                    participantIdentityType: "caller",
-                    callerUserId: callerUserId,
-                    calledUserId: calledUserId
+                    caller: ParticipantDTO(from: call.caller),
+                    callee: ParticipantDTO(from: call.callee)
                 )
                 
                 _ = try await apiClient.send(
@@ -520,25 +526,32 @@ internal actor CallService: CallServicing {
         switch event {
         case .remoteParticipantJoined:
             // Callee joined → call is now connected
-            logger.debug("REMOTE Participant joined -> CONNECT")
             try? await transitionState(callId: callId, to: .connected)
             
         case .remoteParticipantLeft:
-            // Callee left → call ended on their side
-            // Trigger our own end flow
-            logger.error("REMOTE LEFT -> END CALL")
-            try? await end(callId: callId)
+            // The remote side left the room → end the call on our side too.
+            //
+            // This fires in two situations:
+            //   1. The callee genuinely hung up first (we should end).
+            //   2. WE ended the call — our own `end()` disconnected the room,
+            //      which makes LiveKit report the remote participant leaving.
+            //
+            // In case 2 the call is already `.ending`/terminal, and calling
+            // `end()` again throws an invalid-transition error that gets logged
+            // as a noisy stack trace. Guard on the current state so this handler
+            // is idempotent and only acts when the call is genuinely still live.
+            if let call = await stateStore.getCall(callId),
+               !call.state.isTerminal,
+               call.state != .ending {
+                try? await end(callId: callId)
+            } else {
+                logger.debug("Remote participant left for call \(callId) — already ending/ended, ignoring")
+            }
             
         case .roomConnected:
             logger.debug("Room connected for call \(callId)")
             
         case .roomDisconnected(let error):
-            logger.error("""
-            ROOM DISCONNECTED
-
-            error = \(String(describing: error))
-            """)
-            
             if let error = error {
                 logger.warning("Room disconnected with error: \(error.localizedDescription)")
                 let sdkError = KasookooError.callFailed(

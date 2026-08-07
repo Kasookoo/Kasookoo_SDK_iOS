@@ -78,7 +78,6 @@ internal actor StateStore {
         let oldState = sdkState
         sdkState = newState
         logger.info("SDK state: \(oldState.description) → \(newState.description)")
-        print("SDK state: \(oldState.description) → \(newState.description)")
         return oldState
     }
     
