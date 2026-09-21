@@ -54,6 +54,17 @@ internal struct ModuleContext: Sendable {
     /// service(s) here during `configure`. Cannot resolve peers (by design).
     let registry: any ServiceRegistering
 
+    /// Traces and structured logs exported to the observability stack.
+    ///
+    /// Cross-cutting infrastructure like the logger, not a feature module, so it
+    /// is handed to every module rather than resolved from the container. Every
+    /// call is fire and forget and never throws, so instrumentation cannot
+    /// change what a module does.
+    ///
+    /// Defaults to `NoopTelemetry()` so a caller that has not been wired up yet
+    /// still compiles and simply reports nothing.
+    let telemetry: TelemetryReporting
+
     init(
         config: KasookooConfig,
         logger: Logger,
@@ -61,7 +72,8 @@ internal struct ModuleContext: Sendable {
         stateStore: StateStore,
         apiClient: ApiClient,
         sessionManager: SessionManager,
-        registry: any ServiceRegistering
+        registry: any ServiceRegistering,
+        telemetry: TelemetryReporting = NoopTelemetry()
     ) {
         self.config = config
         self.logger = logger
@@ -70,5 +82,6 @@ internal struct ModuleContext: Sendable {
         self.apiClient = apiClient
         self.sessionManager = sessionManager
         self.registry = registry
+        self.telemetry = telemetry
     }
 }

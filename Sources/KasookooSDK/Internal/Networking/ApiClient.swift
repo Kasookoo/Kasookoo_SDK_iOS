@@ -25,6 +25,7 @@ internal protocol AuthTokenProvider: Sendable {
 /// - Decode responses into typed values or `KasookooError`
 /// - Auto-retry on 401 (once) by refreshing the session
 /// - Apply retry policies for network failures
+/// - Attach correlation headers (X-Request-ID, X-Call-Trace-ID, X-User-ID, X-Feature-Type)
 internal final class ApiClient: @unchecked Sendable {
     
     // MARK: - Properties
@@ -38,6 +39,15 @@ internal final class ApiClient: @unchecked Sendable {
     private var authProvider: AuthTokenProvider?
     private let authProviderLock = NSLock()
     
+    /// End user id sent as `X-User-ID` for backend log correlation.
+    /// Set after a successful `identify()`, cleared on disconnect.
+    private var correlationUserId: String?
+    private let correlationLock = NSLock()
+    
+    /// Emits a client span per HTTP attempt and named log events such as
+    /// `SESSION_EXPIRED`. Never throws and never blocks the request.
+    private let telemetry: TelemetryReporting
+    
     // MARK: - Init
     
     init(
@@ -45,9 +55,11 @@ internal final class ApiClient: @unchecked Sendable {
         publishableKey: String,
         organizationId: String,
         logger: Logger,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        telemetry: TelemetryReporting = NoopTelemetry()
     ) {
         self.session = session
+        self.telemetry = telemetry
         self.requestBuilder = RequestBuilder(
             baseURL: baseURL,
             publishableKey: publishableKey,
@@ -71,6 +83,23 @@ internal final class ApiClient: @unchecked Sendable {
         authProviderLock.lock()
         defer { authProviderLock.unlock() }
         return authProvider
+    }
+    
+    // MARK: - Correlation Wiring
+    
+    /// Sets the end user id attached as `X-User-ID` on every request.
+    /// Call with the identified user id after `identify()` succeeds, and with
+    /// `nil` on disconnect / sign out.
+    func setCorrelationUserId(_ userId: String?) {
+        correlationLock.lock()
+        defer { correlationLock.unlock() }
+        self.correlationUserId = userId
+    }
+    
+    private func currentCorrelationUserId() -> String? {
+        correlationLock.lock()
+        defer { correlationLock.unlock() }
+        return correlationUserId
     }
     
     // MARK: - Public Request Methods
@@ -126,7 +155,7 @@ internal final class ApiClient: @unchecked Sendable {
         retryPolicy: RetryPolicy
     ) async throws -> Response {
         
-        let requestId = UUID().uuidString
+        let requestId = TraceContext.newId()
         
         logger.debug("→ \(endpoint.method.rawValue) \(endpoint.path) [reqId: \(requestId)]")
         
@@ -159,6 +188,19 @@ internal final class ApiClient: @unchecked Sendable {
         requestId: String
     ) async throws -> Response {
         
+        // Correlation context for this attempt.
+        let trace = TraceContext.current
+        let correlationUser = currentCorrelationUserId()
+        
+        // One client span per attempt. It nests under whichever feature span is
+        // active, so a slow or failed request is visible inside the user action
+        // that caused it.
+        let span = telemetry.startSpan("http.\(endpoint.method.rawValue)", attributes: [
+            "http.route": .string(ApiClient.route(endpoint.path)),
+            TelemetryKey.requestId: .string(requestId)
+        ])
+        defer { span.end() }
+        
         // Get auth token if needed
         var authToken: String?
         if endpoint.requiresAuth {
@@ -171,14 +213,15 @@ internal final class ApiClient: @unchecked Sendable {
             }
             authToken = try await provider.ensureValidToken()
         }
-        print("→ \(endpoint.method.rawValue) \(endpoint.path) [Body \(body)] \n [Auth Token: \(authToken)] \n [reqId: \(requestId)]")
+        
         // Build the request
-        let urlRequest = try requestBuilder.build(
+        var urlRequest = try requestBuilder.build(
             endpoint: endpoint,
             body: body,
             authToken: authToken,
             requestId: requestId
         )
+        urlRequest.applyCorrelation(trace: trace, userId: correlationUser)
         
         logRequest(urlRequest, endpoint: endpoint, requestId: requestId)
         
@@ -188,10 +231,15 @@ internal final class ApiClient: @unchecked Sendable {
             (data, response) = try await session.data(for: urlRequest)
         } catch {
             logger.warning("Network error on \(endpoint.path): \(error.localizedDescription)")
+            span.setError("Network request failed")
             throw KasookooError.networkUnavailable(
                 message: "Network request failed: \(error.localizedDescription)",
                 underlyingError: error
             )
+        }
+        
+        if let http = response as? HTTPURLResponse {
+            span.setAttribute("http.status_code", .int(http.statusCode))
         }
         
         logResponse(data, response: response, endpoint: endpoint, requestId: requestId)
@@ -204,10 +252,12 @@ internal final class ApiClient: @unchecked Sendable {
                 response: response,
                 requestId: requestId
             )
-            print("← \(endpoint.path) success [reqId: \(requestId)]")
             logger.debug("← \(endpoint.path) success [reqId: \(requestId)]")
+            span.setAttribute(TelemetryKey.result, .string("ok"))
             return decoded
         } catch let error as KasookooError {
+            span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
+            
             // Handle 401: refresh token and retry ONCE
             if error.code == .sessionExpired,
                endpoint.requiresAuth,
@@ -220,16 +270,22 @@ internal final class ApiClient: @unchecked Sendable {
                 } catch {
                     // Refresh failed — propagate the original 401
                     logger.warning("Session refresh failed: \(error.localizedDescription)")
+                    span.setError("Session refresh failed")
+                    logSessionExpired(
+                        route: ApiClient.route(endpoint.path),
+                        reason: "Session refresh failed after a 401."
+                    )
                     throw error
                 }
                 
                 // Retry the original request with the new token
-                let retryRequest = try requestBuilder.build(
+                var retryRequest = try requestBuilder.build(
                     endpoint: endpoint,
                     body: body,
                     authToken: newToken,
                     requestId: requestId
                 )
+                retryRequest.applyCorrelation(trace: trace, userId: correlationUser)
                 
                 logRequest(retryRequest, endpoint: endpoint, requestId: requestId, isRetry: true)
                 
@@ -237,24 +293,35 @@ internal final class ApiClient: @unchecked Sendable {
                 
                 logResponse(retryData, response: retryResponse, endpoint: endpoint, requestId: requestId, isRetry: true)
                 
-                if let http = retryResponse as? HTTPURLResponse, http.statusCode == 401 {
-                    throw KasookooError(
-                        code: .unauthorized,
-                        message: "Authentication failed after refreshing the session.",
-                        retryable: false,
-                        httpStatus: 401
-                    )
+                if let http = retryResponse as? HTTPURLResponse {
+                    span.setAttribute("http.status_code", .int(http.statusCode))
+                    if http.statusCode == 401 {
+                        span.setError("Unauthorized after refresh")
+                        logSessionExpired(
+                            route: ApiClient.route(endpoint.path),
+                            reason: "Still unauthorized after refreshing the session."
+                        )
+                        throw KasookooError(
+                            code: .unauthorized,
+                            message: "Authentication failed after refreshing the session.",
+                            retryable: false,
+                            httpStatus: 401
+                        )
+                    }
                 }
                 
-                return try responseDecoder.decode(
+                let retryDecoded = try responseDecoder.decode(
                     Response.self,
                     from: retryData,
                     response: retryResponse,
                     requestId: requestId
                 )
+                span.setAttribute(TelemetryKey.result, .string("ok_after_refresh"))
+                return retryDecoded
             }
             
             // Not a 401 or no provider — rethrow
+            span.setError(error.message)
             throw error
         }
     }
@@ -319,6 +386,29 @@ internal final class ApiClient: @unchecked Sendable {
         logger.debug("\(tag) \(icon) \(status) \(endpoint.path) [reqId: \(requestId)]\n   Resp: \(body)")
         print("Log Response \(tag) \(icon) \(status) \(endpoint.path) [reqId: \(requestId)]\n   Resp: \(body)")
 #endif
+    }
+    
+    // MARK: - Telemetry Helpers
+    
+    /// The path with any query string removed.
+    ///
+    /// Query items carry user ids, room names and paging values. They belong in
+    /// explicit span attributes, not silently inside a route label.
+    fileprivate static func route(_ path: String) -> String {
+        guard let queryStart = path.firstIndex(of: "?") else { return path }
+        return String(path[path.startIndex..<queryStart])
+    }
+    
+    /// Records a `SESSION_EXPIRED` event. Emitted only when the session could
+    /// not be recovered, so it means "the user must re-authenticate" rather
+    /// than "a token was refreshed", which happens routinely.
+    fileprivate func logSessionExpired(route: String, reason: String) {
+        telemetry.log(
+            event: TelemetryEvent.sessionExpired,
+            message: reason,
+            severity: .error,
+            attributes: ["http.route": .string(route)]
+        )
     }
     
     /// Masks obviously sensitive header values so a shared debug log can't leak a
@@ -403,7 +493,7 @@ extension ApiClient {
         retryPolicy: RetryPolicy
     ) async throws -> Response {
 
-        let requestId = UUID().uuidString
+        let requestId = TraceContext.newId()
         logger.debug("→ \(apiRequest.method.rawValue) \(apiRequest.resolvedPath) [reqId: \(requestId)]")
 
         return try await Retrier.execute(
@@ -435,6 +525,16 @@ extension ApiClient {
         requestId: String
     ) async throws -> Response {
 
+        // Correlation context for this attempt.
+        let trace = TraceContext.current
+        let correlationUser = currentCorrelationUserId()
+
+        let span = telemetry.startSpan("http.\(apiRequest.method.rawValue)", attributes: [
+            "http.route": .string(ApiClient.route(apiRequest.resolvedPath)),
+            TelemetryKey.requestId: .string(requestId)
+        ])
+        defer { span.end() }
+
         // Auth token if needed.
         var authToken: String?
         if apiRequest.requiresAuth {
@@ -448,12 +548,13 @@ extension ApiClient {
             authToken = try await provider.ensureValidToken()
         }
 
-        let urlRequest = try requestBuilder.build(
+        var urlRequest = try requestBuilder.build(
             apiRequest: apiRequest,
             body: body,
             authToken: authToken,
             requestId: requestId
         )
+        urlRequest.applyCorrelation(trace: trace, userId: correlationUser)
 
         // Execute.
         let (data, response): (Data, URLResponse)
@@ -461,10 +562,15 @@ extension ApiClient {
             (data, response) = try await session.data(for: urlRequest)
         } catch {
             logger.warning("Network error on \(apiRequest.resolvedPath): \(error.localizedDescription)")
+            span.setError("Network request failed")
             throw KasookooError.networkUnavailable(
                 message: "Network request failed: \(error.localizedDescription)",
                 underlyingError: error
             )
+        }
+
+        if let http = response as? HTTPURLResponse {
+            span.setAttribute("http.status_code", .int(http.statusCode))
         }
 
         // Decode.
@@ -476,8 +582,11 @@ extension ApiClient {
                 requestId: requestId
             )
             logger.debug("← \(apiRequest.resolvedPath) success [reqId: \(requestId)]")
+            span.setAttribute(TelemetryKey.result, .string("ok"))
             return decoded
         } catch let error as KasookooError {
+            span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
+
             // 401: refresh once and retry.
             if error.code == .sessionExpired,
                apiRequest.requiresAuth,
@@ -489,25 +598,51 @@ extension ApiClient {
                     newToken = try await provider.forceRefresh()
                 } catch {
                     logger.warning("Session refresh failed: \(error.localizedDescription)")
+                    span.setError("Session refresh failed")
+                    logSessionExpired(
+                        route: ApiClient.route(apiRequest.resolvedPath),
+                        reason: "Session refresh failed after a 401."
+                    )
                     throw error
                 }
 
-                let retryRequest = try requestBuilder.build(
+                var retryRequest = try requestBuilder.build(
                     apiRequest: apiRequest,
                     body: body,
                     authToken: newToken,
                     requestId: requestId
                 )
+                retryRequest.applyCorrelation(trace: trace, userId: correlationUser)
 
                 let (retryData, retryResponse) = try await session.data(for: retryRequest)
 
-                return try responseDecoder.decode(
+                if let http = retryResponse as? HTTPURLResponse {
+                    span.setAttribute("http.status_code", .int(http.statusCode))
+                    if http.statusCode == 401 {
+                        span.setError("Unauthorized after refresh")
+                        logSessionExpired(
+                            route: ApiClient.route(apiRequest.resolvedPath),
+                            reason: "Still unauthorized after refreshing the session."
+                        )
+                        throw KasookooError(
+                            code: .unauthorized,
+                            message: "Authentication failed after refreshing the session.",
+                            retryable: false,
+                            httpStatus: 401
+                        )
+                    }
+                }
+
+                let retryDecoded = try responseDecoder.decode(
                     Response.self,
                     from: retryData,
                     response: retryResponse,
                     requestId: requestId
                 )
+                span.setAttribute(TelemetryKey.result, .string("ok_after_refresh"))
+                return retryDecoded
             }
+            span.setError(error.message)
             throw error
         }
     }

@@ -35,7 +35,8 @@ internal struct MessagingModule: SDKModule {
             stateStore: context.stateStore,
             eventBus: context.eventBus,
             logger: context.logger,
-            config: context.config
+            config: context.config,
+            telemetry: context.telemetry
         )
         context.registry.register(MessagingServicing.self, service)
         context.logger.debug("MessagingModule configured and registered")

@@ -24,6 +24,10 @@ internal struct AssembledSDK {
     let container: ServiceContainer
     let moduleRegistry: SDKModuleRegistry
     let pushRouter: PushRouter
+
+    // Cross-cutting infrastructure, like the logger. Held here so the facade
+    // can set the user id, flush on disconnect, and shut the pipeline down.
+    let telemetry: TelemetryReporting
 }
 
 /// Constructs the full SDK component graph.
@@ -53,6 +57,15 @@ internal enum SDKBuilder {
         let eventBus = EventBus(logger: logger)
         let stateStore = StateStore(logger: logger)
         
+        // Telemetry is built early so every layer below can be instrumented.
+        // `TelemetryFactory` returns a no-op reporter when the tenant has
+        // telemetry disabled, so nothing downstream has to branch on it.
+        let telemetry = TelemetryFactory.make(
+            configuration: config.effectiveTelemetry,
+            organizationId: config.organizationId,
+            logger: logger
+        )
+        
         // ─────────────────────────────────────────────────────────────
         // Layer 2: Networking
         // ─────────────────────────────────────────────────────────────
@@ -61,7 +74,8 @@ internal enum SDKBuilder {
             baseURL: config.baseURL,
             publishableKey: config.publishableKey,
             organizationId: config.organizationId,
-            logger: logger
+            logger: logger,
+            telemetry: telemetry
         )
         
         // ─────────────────────────────────────────────────────────────
@@ -134,7 +148,8 @@ internal enum SDKBuilder {
             stateStore: stateStore,
             apiClient: apiClient,
             sessionManager: sessionManager,
-            registry: container
+            registry: container,
+            telemetry: telemetry
         )
         let moduleRegistry = SDKModuleRegistry(modules: [
             MessagingModule()
@@ -155,7 +170,8 @@ internal enum SDKBuilder {
             notificationService: notificationService,
             container: container,
             moduleRegistry: moduleRegistry,
-            pushRouter: pushRouter
+            pushRouter: pushRouter,
+            telemetry: telemetry
         )
     }
 }

@@ -241,10 +241,27 @@ internal actor SessionManager {
         // response id, fall back to the known id from the prior token (on
         // rotation the backend may omit it and expect the same session), and
         // only fail loudly if neither exists — never invent a fake id.
-        guard let sessionId = response.sessionId ?? fallbackSessionId else {
+        //
+        // The `sid` claim is the third source, and in practice the one that
+        // saves us: the create-session endpoint returns only
+        // `{token, token_type, expires_in, created_at}`, with no top level
+        // `session_id`, but the JWT it hands back carries
+        // `"sid": "sess_..."`. That claim describes exactly the session this
+        // token belongs to, so it is preferred over the previous session's id.
+        // The facade already reads `organization_id` out of the JWT the same
+        // way rather than trusting configuration.
+        let sessionId: String
+        if let id = response.sessionId {
+            sessionId = id
+        } else if let id = SessionManager.sessionId(fromJWT: accessToken) {
+            logger.debug("Session id taken from the token's `sid` claim: \(id)")
+            sessionId = id
+        } else if let id = fallbackSessionId {
+            sessionId = id
+        } else {
             throw KasookooError(
                 code: .sessionInvalid,
-                message: "Session response did not contain a session_id, and no existing session id was available. Cannot build refresh URL.",
+                message: "Session response contained no session_id, the token carried no `sid` claim, and no existing session id was available. Cannot build refresh URL.",
                 retryable: false
             )
         }
@@ -258,6 +275,32 @@ internal actor SessionManager {
         )
     }
     
+    // MARK: - Token Claims
+
+    /// Reads the `sid` (session id) claim out of a session JWT.
+    ///
+    /// Decodes the payload only. This is not verification: the token is already
+    /// trusted, having just been issued by the backend over TLS. It is read
+    /// solely to recover an id the response body omits.
+    private static func sessionId(fromJWT token: String) -> String? {
+        let segments = token.split(separator: ".")
+        guard segments.count >= 2 else { return nil }
+
+        var base64 = String(segments[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 { base64 += "=" }
+
+        guard let data = Data(base64Encoded: base64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sid = json["sid"] as? String,
+              !sid.isEmpty
+        else {
+            return nil
+        }
+        return sid
+    }
+
     // MARK: - Refresh Scheduling
     
     private func scheduleRefresh(for token: StoredToken) async {

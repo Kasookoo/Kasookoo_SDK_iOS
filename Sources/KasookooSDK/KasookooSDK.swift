@@ -250,6 +250,12 @@ public final class KasookooSDK: @unchecked Sendable {
         // Clear active calls
         await bundle.stateStore.clearAllCalls()
         
+        // Stop correlating, then export whatever the batch processors still
+        // hold so a disconnect does not lose the records that explain it.
+        bundle.apiClient.setCorrelationUserId(nil)
+        bundle.telemetry.setUserId(nil)
+        bundle.telemetry.flush()
+        
         await bundle.stateStore.setState(.disconnected)
         await emitSDKEvent(
             EventName.sdkConnectionChanged,
@@ -288,6 +294,10 @@ public final class KasookooSDK: @unchecked Sendable {
         
         // Clear notification handler
         await bundle.notificationService.setIncomingCallHandler(nil)
+        
+        // Flush and stop the telemetry pipeline last, so anything emitted
+        // during teardown still leaves the device.
+        bundle.telemetry.shutdown()
     }
     
     // MARK: - Identity
@@ -304,6 +314,32 @@ public final class KasookooSDK: @unchecked Sendable {
         try callerProfile.validate()
         let bundle = try requireAssembled()
 
+        // One lifecycle covers the token refresh and the identify call, so both
+        // carry the same `call_trace_id` into the backend's logs.
+        try await TraceContext.run(.authenticationCalling) {
+            let span = bundle.telemetry.startSpan(TelemetrySpan.identify)
+            defer { span.end() }
+
+            do {
+                try await self.performIdentify(callerProfile: callerProfile, bundle: bundle)
+                span.setAttribute(TelemetryKey.result, .string("ok"))
+            } catch let error as KasookooError {
+                span.setError(error.message)
+                span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
+                bundle.telemetry.log(
+                    event: error.code == .userNotFound
+                        ? TelemetryEvent.userNotFound
+                        : TelemetryEvent.identifyFailed,
+                    message: error.message,
+                    severity: .error,
+                    attributes: [TelemetryKey.errorCode: .string(error.code.rawValue)]
+                )
+                throw error
+            }
+        }
+    }
+
+    private func performIdentify(callerProfile: CallerProfile, bundle: AssembledSDK) async throws {
         // The `organization_id` sent here MUST match the organization the session
         // was authenticated for (the backend returns 403 otherwise). The
         // authoritative source is the session JWT itself, so we read it from the
@@ -338,6 +374,12 @@ public final class KasookooSDK: @unchecked Sendable {
             )
         }
 
+        // From here on every API request carries `X-User-ID`, and every span
+        // and log record carries `user_id`, so backend logs in Loki and client
+        // telemetry join on the same user.
+        bundle.apiClient.setCorrelationUserId(userId)
+        bundle.telemetry.setUserId(userId)
+
         // Cache email → user_id so subsequent messaging.send() can resolve emails.
         await bundle.stateStore.setIdentifiedUser(callerProfile, userId: userId)
         bundle.logger.info("User identified: \(callerProfile.email) [userId: \(userId)]")
@@ -349,6 +391,8 @@ public final class KasookooSDK: @unchecked Sendable {
     public func clearIdentity() async throws {
         let bundle = try requireAssembled()
         await bundle.stateStore.setIdentifiedUser(nil)
+        bundle.apiClient.setCorrelationUserId(nil)
+        bundle.telemetry.setUserId(nil)
         bundle.logger.info("Identity cleared")
     }
     

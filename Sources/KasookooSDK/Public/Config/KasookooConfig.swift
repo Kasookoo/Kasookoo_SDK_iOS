@@ -58,12 +58,40 @@ public struct KasookooConfig: Sendable {
     /// Useful for testing against non-standard backends.
     public let customBaseURL: URL?
     
+    /// Telemetry reporting configuration.
+    ///
+    /// Leave as `nil` to follow `environment`: production reports to the
+    /// production collector, staging and development report to the test
+    /// collector. Pass `.disabled` to switch client side reporting off.
+    public let telemetry: TelemetryConfiguration?
+    
     // MARK: - Computed Properties
     
     /// The effective base URL for backend requests.
     /// Returns `customBaseURL` if set, otherwise the environment's default URL.
     public var baseURL: URL {
         return customBaseURL ?? environment.baseURL
+    }
+    
+    /// The telemetry configuration actually used, after applying the
+    /// environment default when none was supplied.
+    ///
+    /// An explicitly supplied configuration is used as given. A derived one
+    /// also reports `deployment.environment` as the SDK environment, so
+    /// staging traffic is distinguishable from development in Grafana.
+    public var effectiveTelemetry: TelemetryConfiguration {
+        if let telemetry {
+            return telemetry
+        }
+        var derived: TelemetryConfiguration
+        switch environment {
+        case .production:
+            derived = .production
+        case .staging, .development:
+            derived = .test
+        }
+        derived.environment = environment.rawValue
+        return derived
     }
     
     // MARK: - Initialization
@@ -79,6 +107,7 @@ public struct KasookooConfig: Sendable {
     ///   - features: Feature flags. Defaults to `.default`.
     ///   - logging: Logging configuration. Defaults to `.default`.
     ///   - customBaseURL: Optional URL override.
+    ///   - telemetry: Telemetry reporting. Defaults to the environment's setting.
     public init(
         publishableKey: String,
         organizationId: String,
@@ -87,7 +116,8 @@ public struct KasookooConfig: Sendable {
         userMode: UserMode = .guest,
         features: FeatureFlags = .default,
         logging: LoggingConfig = .default,
-        customBaseURL: URL? = nil
+        customBaseURL: URL? = nil,
+        telemetry: TelemetryConfiguration? = nil
     ) {
         self.publishableKey = publishableKey
         self.organizationId = organizationId
@@ -97,6 +127,7 @@ public struct KasookooConfig: Sendable {
         self.features = features
         self.logging = logging
         self.customBaseURL = customBaseURL
+        self.telemetry = telemetry
     }
     
     // MARK: - Validation

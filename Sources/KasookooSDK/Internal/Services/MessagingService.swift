@@ -15,6 +15,7 @@ internal actor MessagingService: MessagingServicing {
     private let eventBus: EventBus
     private let logger: Logger
     private let config: KasookooConfig
+    private let telemetry: TelemetryReporting
     
     /// Cached messaging tokens keyed by room name.
     private var roomTokens: [String: String] = [:]
@@ -26,13 +27,15 @@ internal actor MessagingService: MessagingServicing {
         stateStore: StateStore,
         eventBus: EventBus,
         logger: Logger,
-        config: KasookooConfig
+        config: KasookooConfig,
+        telemetry: TelemetryReporting = NoopTelemetry()
     ) {
         self.apiClient = apiClient
         self.stateStore = stateStore
         self.eventBus = eventBus
         self.logger = logger
         self.config = config
+        self.telemetry = telemetry
     }
     
     // MARK: - MessagingServicing: connect
@@ -87,8 +90,45 @@ internal actor MessagingService: MessagingServicing {
     
     // MARK: - MessagingServicing: send
     
+    /// Instrumented entry point.
+    ///
+    /// `TraceContext.run` opens one feature lifecycle, so the send and every
+    /// API request it makes share a single `call_trace_id`. That id also goes
+    /// out as `X-Call-Trace-ID`, which is what joins this span in Tempo to the
+    /// backend's own logs in Loki.
     @discardableResult
     func send(params: SendMessageParams) async throws -> Message {
+        return try await TraceContext.run(.inAppMessaging) { () -> Message in
+            let span = self.telemetry.startSpan(TelemetrySpan.messagingSend, attributes: [
+                "room_name": .string(params.roomName),
+                "message_type": .string(params.messageType.rawValue),
+                "is_push_notification": .bool(params.isPushNotification)
+            ])
+            defer { span.end() }
+
+            do {
+                let message = try await self.performSend(params: params)
+                span.setAttribute(TelemetryKey.result, .string("ok"))
+                span.setAttribute("message_id", .string(message.id))
+                return message
+            } catch let error as KasookooError {
+                span.setError(error.message)
+                span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
+                self.telemetry.log(
+                    event: TelemetryEvent.messageSendFailed,
+                    message: error.message,
+                    severity: .error,
+                    attributes: [
+                        "room_name": .string(params.roomName),
+                        TelemetryKey.errorCode: .string(error.code.rawValue)
+                    ]
+                )
+                throw error
+            }
+        }
+    }
+
+    private func performSend(params: SendMessageParams) async throws -> Message {
         try params.validate()
         
         guard config.features.messaging else {
@@ -200,6 +240,28 @@ internal actor MessagingService: MessagingServicing {
     // MARK: - MessagingServicing: listConversations
     
     func listConversations(filters: ConversationFilters) async throws -> PaginatedResult<Conversation> {
+        return try await TraceContext.run(.inAppMessaging) { () -> PaginatedResult<Conversation> in
+            let span = self.telemetry.startSpan(TelemetrySpan.messagingSync, attributes: [
+                "operation": .string("list_conversations"),
+                "skip": .int(filters.skip),
+                "limit": .int(filters.limit)
+            ])
+            defer { span.end() }
+
+            do {
+                let result = try await self.performListConversations(filters: filters)
+                span.setAttribute(TelemetryKey.result, .string("ok"))
+                span.setAttribute("item_count", .int(result.items.count))
+                return result
+            } catch let error as KasookooError {
+                span.setError(error.message)
+                span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
+                throw error
+            }
+        }
+    }
+
+    private func performListConversations(filters: ConversationFilters) async throws -> PaginatedResult<Conversation> {
         guard config.features.messaging else {
             throw KasookooError.messageSendFailed(
                 message: "Messaging is disabled.",
@@ -251,6 +313,35 @@ internal actor MessagingService: MessagingServicing {
     // MARK: - MessagingServicing: getMessages
     
     func getMessages(
+        conversationId: String,
+        paging: MessagePaging
+    ) async throws -> PaginatedResult<Message> {
+        return try await TraceContext.run(.inAppMessaging) { () -> PaginatedResult<Message> in
+            let span = self.telemetry.startSpan(TelemetrySpan.messagingSync, attributes: [
+                "operation": .string("get_messages"),
+                "conversation_id": .string(conversationId),
+                "skip": .int(paging.skip),
+                "limit": .int(paging.limit)
+            ])
+            defer { span.end() }
+
+            do {
+                let result = try await self.performGetMessages(
+                    conversationId: conversationId,
+                    paging: paging
+                )
+                span.setAttribute(TelemetryKey.result, .string("ok"))
+                span.setAttribute("item_count", .int(result.items.count))
+                return result
+            } catch let error as KasookooError {
+                span.setError(error.message)
+                span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
+                throw error
+            }
+        }
+    }
+
+    private func performGetMessages(
         conversationId: String,
         paging: MessagePaging
     ) async throws -> PaginatedResult<Message> {

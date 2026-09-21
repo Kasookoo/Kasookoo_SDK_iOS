@@ -133,7 +133,10 @@ private struct EmptyBody: Encodable, Sendable {}
 
 /// SDK version constant.
 internal enum SDKVersion {
-    static let current = "0.1.0"
+    /// Keep in step with the git tag. Reported as `X-Kasookoo-SDK` on every
+    /// request and as `service.version` on every span, so a wrong value here
+    /// misattributes production telemetry.
+    static let current = "1.0.6"
 }
 
 // MARK: - APIRequest support (ADDITIVE — Map §14, seam #2)
