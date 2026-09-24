@@ -121,16 +121,29 @@ public protocol NotificationServicing: Sendable {
     ///
     /// Call this from `UNUserNotificationCenter` delegate or from
     /// `application(_:didReceiveRemoteNotification:fetchCompletionHandler:)`.
+    ///
+    /// - Returns: `true` if the push was a Kasookoo call or message push and
+    ///   the SDK handled it; `false` for any other push, which the host app
+    ///   should handle itself (a `notification.received` event is still
+    ///   emitted for it).
     @discardableResult
     func handlePushNotification(payload: PushPayload) async -> Bool
     
     /// Processes a VoIP push notification payload (PushKit).
     ///
     /// Call this from your `PKPushRegistryDelegate`'s
-    /// `pushRegistry(_:didReceiveIncomingPushWith:for:completion:)` method.
+    /// `pushRegistry(_:didReceiveIncomingPushWith:for:completion:)` method,
+    /// and call the `completion` handler after this returns.
     ///
-    /// **Critical:** The SDK will report the incoming call to CallKit within
-    /// the 5-second window required by Apple.
+    /// The call is reported to CallKit before any other work, as PushKit
+    /// requires. A VoIP push that is not an incoming call (for example a
+    /// cancellation) is reported as a call that ends immediately, because iOS
+    /// terminates apps that receive a VoIP push without reporting a call.
+    ///
+    /// - Important: The SDK must already be initialized when the push
+    ///   arrives. PushKit delivers a pending push as soon as the
+    ///   `PKPushRegistry` delegate is set, so create the registry only after
+    ///   `initialize(config:)` has completed.
     @discardableResult
     func handleVoIPPush(payload: PushPayload) async -> Bool
 }

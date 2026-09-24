@@ -12,6 +12,12 @@ import OSLog
 /// Wraps Apple's `os.Logger` for system-level logging and optionally prints
 /// to the console for development.
 ///
+/// **Privacy:** in release builds messages are written to the unified log as
+/// `.private`, so they are redacted in sysdiagnoses and Console unless a
+/// debugger is attached. This SDK runs inside other companies' apps, and ids,
+/// room names and error text should not be readable from a device log.
+/// Debug builds stay `.public` for development.
+///
 /// **Security:** Never log tokens, passwords, OTPs, or PII via this logger.
 internal final class Logger: @unchecked Sendable {
     
@@ -84,7 +90,10 @@ internal final class Logger: @unchecked Sendable {
         let location = "(\(file):\(line))"
         let fullMessage = "\(prefix) \(message) \(location)"
         
-        // Always send to os.Logger (visible in Console.app, Instruments)
+        // Always send to os.Logger (visible in Console.app, Instruments).
+        // The privacy level must be a compile-time constant, hence the two
+        // switch copies.
+#if DEBUG
         switch level {
         case .verbose, .debug:
             osLogger.debug("\(fullMessage, privacy: .public)")
@@ -97,6 +106,20 @@ internal final class Logger: @unchecked Sendable {
         case .none:
             break
         }
+#else
+        switch level {
+        case .verbose, .debug:
+            osLogger.debug("\(fullMessage, privacy: .private)")
+        case .info:
+            osLogger.info("\(fullMessage, privacy: .private)")
+        case .warning:
+            osLogger.warning("\(fullMessage, privacy: .private)")
+        case .error:
+            osLogger.error("\(fullMessage, privacy: .private)")
+        case .none:
+            break
+        }
+#endif
         
         // Print to console if enabled
         if config.enableConsole {

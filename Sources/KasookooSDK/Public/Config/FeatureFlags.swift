@@ -44,7 +44,7 @@ public struct FeatureFlags: Sendable, Codable {
     /// - Parameters:
     ///   - calling: Enable WebRTC calling. Defaults to `true`.
     ///   - messaging: Enable messaging. Defaults to `true`.
-    ///   - sipCalling: Enable SIP calling. Defaults to `true`.
+    ///   - sipCalling: Enable SIP calling. Defaults to `false`.
     ///   - pushNotifications: Enable push notifications. Defaults to `true`.
     ///   - recording: Enable call recording. Defaults to `false`.
     public init(

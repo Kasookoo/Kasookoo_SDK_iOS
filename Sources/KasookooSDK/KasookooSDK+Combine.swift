@@ -48,12 +48,25 @@ extension KasookooSDK {
     }
     
     /// A publisher that emits the SDK's connection state changes.
+    ///
+    /// Previously this never emitted anything. It now maps each
+    /// `sdk.connection.changed` event to an `SDKState`.
     public var connectionState: AnyPublisher<SDKState, Never> {
         return events(named: EventName.sdkConnectionChanged)
-            .compactMap { [weak self] _ -> SDKState? in
-                guard let self = self else { return nil }
-                // Bridge async getState() into the publisher
-                return nil  // See note below
+            .compactMap { event -> SDKState? in
+                switch event.string("state") {
+                case "initialized": return .initialized
+                case "connecting": return .connecting
+                case "connected": return .connected
+                case "disconnecting": return .disconnecting
+                case "disconnected": return .disconnected
+                case "error":
+                    let code = event.string("errorCode").flatMap { ErrorCode(rawValue: $0) } ?? .unknownError
+                    let message = event.string("errorMessage") ?? "Connection failed."
+                    return .error(KasookooError(code: code, message: message))
+                default:
+                    return nil
+                }
             }
             .eraseToAnyPublisher()
     }
@@ -96,7 +109,8 @@ private final class EventsSubscription: Subscription, @unchecked Sendable {
     
     func request(_ demand: Subscribers.Demand) {
         // EventBus is push-based; demand-based throttling is not implemented.
-        // Subscribers receive every event regardless of requested demand.
+        // Subscribers receive every event regardless of requested demand
+        // (use `.buffer` downstream if you need back-pressure).
     }
     
     func cancel() {

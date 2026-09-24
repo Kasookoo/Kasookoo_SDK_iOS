@@ -26,9 +26,9 @@
 //  ─────────────────────────────────────────────────────────────────────────────
 //  TRANSITIONAL
 //  ─────────────────────────────────────────────────────────────────────────────
-//  Additive. Nothing uses this yet — `AssembledSDK` + `SDKBuilder` still run the
-//  show. Services move onto the container one at a time in a later step; the
-//  struct is removed only once empty. Existing behaviour is unchanged.
+//  Messaging is registered here and resolved by the facade. The other services
+//  are still fields on `AssembledSDK` and move onto the container one at a
+//  time; the struct is removed only once empty.
 //
 //  ─────────────────────────────────────────────────────────────────────────────
 //  CONCURRENCY

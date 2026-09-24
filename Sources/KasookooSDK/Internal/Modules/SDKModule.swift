@@ -24,9 +24,8 @@
 //  ─────────────────────────────────────────────────────────────────────────────
 //  ADDITIVE
 //  ─────────────────────────────────────────────────────────────────────────────
-//  Nothing conforms to this yet. The SDK still assembles services directly via
-//  `SDKBuilder`. Modules adopt it one at a time in later steps; existing
-//  behaviour is unchanged.
+//  `MessagingModule` conforms today. Calling, SIP and notifications are still
+//  assembled directly by `SDKBuilder` and adopt this one at a time.
 //
 
 import Foundation

@@ -25,10 +25,13 @@ internal enum MessagingRequests {
 
     /// `POST /api/v1/messaging/get-token`
     static var getToken: APIRequest {
-        APIRequest(path: "/api/v1/messaging/get-token", method: .post, timeout: .messaging)
+        APIRequest(path: "/api/v1/messaging/get-token", method: .post, timeout: .messaging, isRepeatable: true)
     }
 
     /// `POST /api/v1/messaging/send`
+    ///
+    /// Not repeatable: a timeout may mean the message was stored, so a retry
+    /// would deliver it twice. Only pre-transmission failures are retried.
     static var send: APIRequest {
         APIRequest(path: "/api/v1/messaging/send", method: .post, timeout: .messaging)
     }
@@ -62,7 +65,7 @@ internal enum MessagingRequests {
 
     /// `POST /api/v1/messaging/mark-read`
     static var markRead: APIRequest {
-        APIRequest(path: "/api/v1/messaging/mark-read", method: .post, timeout: .messaging)
+        APIRequest(path: "/api/v1/messaging/mark-read", method: .post, timeout: .messaging, isRepeatable: true)
     }
 
     /// `GET /api/v1/messaging/unread-count`

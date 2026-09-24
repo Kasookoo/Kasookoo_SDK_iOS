@@ -7,6 +7,7 @@
 
 import Foundation
 import UIKit
+import CallKit
 
 /// Concrete implementation of `NotificationServicing`.
 internal actor NotificationService: NotificationServicing {
@@ -71,6 +72,22 @@ internal actor NotificationService: NotificationServicing {
         provider.setDelegate(self)
         self.callKitProvider = provider
         
+        // Dismiss the system call UI whenever a call ends outside CallKit:
+        // remote hang-up, failure, or the host app's own end button. Without
+        // this the CallKit call (and the green status pill) outlived the call.
+        let endEvents: [(String, CXCallEndedReason)] = [
+            (EventName.callEnded, .remoteEnded),
+            (EventName.sipEnded, .remoteEnded),
+            (EventName.callFailed, .failed),
+            (EventName.sipFailed, .failed)
+        ]
+        for (eventName, reason) in endEvents {
+            _ = eventBus.subscribe(to: eventName) { [weak provider] event in
+                guard let callId = event.string("callId") else { return }
+                provider?.reportCallEnded(callId: callId, reason: reason)
+            }
+        }
+        
         logger.info("CallKit initialized")
     }
     
@@ -92,7 +109,7 @@ internal actor NotificationService: NotificationServicing {
         
         guard let userId = await stateStore.resolveUserId(forEmail: profile.email) else {
             throw KasookooError.configInvalid(
-                "Cannot register for push: the backend user id for \(profile.email) is not known. Ensure identify() completed successfully."
+                "Cannot register for push: the backend user id of the identified user is not known. Ensure identify() completed successfully."
             )
         }
         
@@ -215,6 +232,18 @@ internal actor NotificationService: NotificationServicing {
     @discardableResult
     func handleVoIPPush(payload: PushPayload) async -> Bool {
         let parsed = payloadParser.parse(payload)
+        
+        // CallKit first, before any state or event work: PushKit gives the
+        // app a few seconds to report a call and terminates it otherwise.
+        // Every VoIP push must report one, so a push that is not an incoming
+        // call is satisfied with a placeholder that ends immediately.
+        switch parsed {
+        case .incomingCall(let info), .incomingSipCall(let info):
+            await reportToCallKit(info: info)
+        default:
+            await reportPlaceholderToCallKit()
+        }
+        
         return await handleParsedPush(parsed, isVoIP: true)
     }
     
@@ -239,8 +268,10 @@ internal actor NotificationService: NotificationServicing {
             return true
             
         case .generic(let data):
+            // Not a Kasookoo call or message. Still surfaced as an event, but
+            // reported as unhandled so the host app processes it itself.
             await emitNotificationReceived(data: data)
-            return true
+            return false
             
         case .unknown:
             logger.debug("Push payload not recognized as Kasookoo notification")
@@ -252,6 +283,16 @@ internal actor NotificationService: NotificationServicing {
     
     private func handleIncomingCallPush(info: IncomingCallInfo, isSip: Bool, isVoIP: Bool) async {
         logger.info("Handling incoming call push: \(info.callId), isSip: \(isSip), isVoIP: \(isVoIP)")
+        
+        // The same call can arrive twice (FCM and PushKit, or a redelivered
+        // push). Only the first one creates state and a `call.incoming` event.
+        if let existing = await stateStore.getCall(info.callId), !existing.state.isTerminal {
+            logger.debug("Duplicate incoming-call push for \(info.callId) — ignoring")
+            if isVoIP {
+                await reportToCallKit(info: info)  // no-op if already reported
+            }
+            return
+        }
         
         let callInfo = CallInfo(
             id: info.callId,
@@ -300,12 +341,21 @@ internal actor NotificationService: NotificationServicing {
             return
         }
         
+        guard !provider.isReported(callId: info.callId) else { return }
+        
         do {
             try await provider.reportIncomingCall(info)
             logger.info("Incoming call reported to CallKit: \(info.callId)")
         } catch {
             logger.error("Failed to report incoming call to CallKit: \(error.localizedDescription)")
         }
+    }
+    
+    private func reportPlaceholderToCallKit() async {
+        if callKitProvider == nil {
+            await initializeCallKit()
+        }
+        await callKitProvider?.reportPlaceholderCallAndEnd()
     }
     
     // MARK: - Call Cancelled
@@ -315,6 +365,16 @@ internal actor NotificationService: NotificationServicing {
         
         if let provider = callKitProvider {
             provider.reportCallEnded(callId: callId, reason: .remoteEnded)
+        }
+        
+        // Already answered: end it properly, which disconnects the media room
+        // and emits `call.ended`. Marking an answered call "missed" left its
+        // room (and microphone) running.
+        if let call = await stateStore.getCall(callId),
+           call.state != .ringing,
+           !call.state.isTerminal {
+            try? await callService?.end(callId: callId)
+            return
         }
         
         if await stateStore.getCall(callId) != nil {
@@ -461,6 +521,14 @@ extension NotificationService: CallKitProviderDelegate {
         await processEnd(uuid: uuid)
     }
     
+    nonisolated func callKitDidSetMuted(uuid: UUID, muted: Bool) async {
+        await processMute(uuid: uuid, muted: muted)
+    }
+    
+    nonisolated func callKitDidPlayDTMF(uuid: UUID, digits: String) async {
+        await processDTMF(uuid: uuid, digits: digits)
+    }
+    
     nonisolated func callKitDidActivateAudioSession() async {
         // LiveKit handles audio session as part of call connection
     }
@@ -481,6 +549,35 @@ extension NotificationService: CallKitProviderDelegate {
         
         logger.info("User answered call via CallKit: \(info.callId)")
         await _incomingCallHandler?.incomingCallAnswered(info)
+    }
+    
+    /// Applies the mute button on the system call screen to the media room.
+    /// Previously ignored, which left the microphone live while the system UI
+    /// showed the call as muted. Calls reported to CallKit are incoming calls,
+    /// and incoming calls (WebRTC and SIP) are owned by `CallService`.
+    private func processMute(uuid: UUID, muted: Bool) async {
+        guard let callId = callKitProvider?.callId(for: uuid) else {
+            logger.warning("Mute received for unknown UUID: \(uuid)")
+            return
+        }
+        do {
+            try await callService?.setMuted(muted, callId: callId)
+        } catch {
+            logger.warning("Could not apply CallKit mute to call \(callId): \(error.localizedDescription)")
+        }
+    }
+    
+    /// Sends keypad digits entered on the system call screen (SIP calls).
+    private func processDTMF(uuid: UUID, digits: String) async {
+        guard let callId = callKitProvider?.callId(for: uuid) else { return }
+        for digit in digits {
+            do {
+                try await callService?.sendDTMF(String(digit), callId: callId)
+            } catch {
+                logger.warning("Could not send DTMF for call \(callId): \(error.localizedDescription)")
+                return
+            }
+        }
     }
     
     private func processEnd(uuid: UUID) async {
