@@ -92,6 +92,15 @@ internal protocol TelemetryReporting: Sendable {
         attributes: [String: TelemetryAttribute]
     )
 
+    /// Emits a plain log line (the SDK's own `Logger` output), so it appears
+    /// in Loki next to the backend's logs. Unlike `log(event:)` it carries no
+    /// `event` attribute: it is context, not a queryable incident.
+    func logMessage(
+        _ message: String,
+        severity: TelemetrySeverity,
+        attributes: [String: TelemetryAttribute]
+    )
+
     /// Sets the end user id attached to spans and logs as `user_id`.
     /// Pass `nil` on disconnect or sign out.
     func setUserId(_ userId: String?)
@@ -137,6 +146,12 @@ internal struct NoopTelemetry: TelemetryReporting {
     func log(
         event: String,
         message: String,
+        severity: TelemetrySeverity,
+        attributes: [String: TelemetryAttribute]
+    ) {}
+
+    func logMessage(
+        _ message: String,
         severity: TelemetrySeverity,
         attributes: [String: TelemetryAttribute]
     ) {}
@@ -202,4 +217,20 @@ internal enum TelemetryKey {
     static let level = "level"
     static let result = "result"
     static let errorCode = "error_code"
+    /// Category of the SDK logger that wrote the line (e.g. "SDK").
+    static let logger = "logger"
+    /// "File.swift:123" of the log call. ("code.*" keys are redacted.)
+    static let source = "source"
+}
+
+extension LoggingConfig.Level {
+    /// Severity used when a logger line is exported.
+    var telemetrySeverity: TelemetrySeverity {
+        switch self {
+        case .verbose, .debug: return .debug
+        case .info, .none: return .info
+        case .warning: return .warn
+        case .error: return .error
+        }
+    }
 }
