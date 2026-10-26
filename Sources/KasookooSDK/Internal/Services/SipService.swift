@@ -54,6 +54,9 @@ internal actor SipService: SipServicing {
     /// a second hangup before the first has finished.
     private var endingSipCallIds: Set<String> = []
     
+    /// Local call ids that were re-keyed to the backend's `room_session_id`.
+    private var callIdAliases: [String: String] = [:]
+    
     // MARK: - Init
     
     init(
@@ -86,9 +89,10 @@ internal actor SipService: SipServicing {
         // Generate a room name if the consumer didn't provide one.
         let roomName = params.roomName ?? "sip_\(UUID().uuidString.lowercased())"
         let participantName = params.caller.name
-        let callId = UUID().uuidString  // SDK-side ID; may be re-keyed to backend's room_session_id below.
+        let localCallId = UUID().uuidString  // SDK-side ID; may be re-keyed to backend's room_session_id below.
+        var activeCallId = localCallId
         
-        logger.info("Dialing SIP: \(params.destinationNumber) [room: \(roomName)]")
+        logger.info("Dialing SIP call [room: \(roomName)]")
         
         // ─── Build initial CallInfo (state: initiating) ───────────────
         let calleePlaceholder = Participant(
@@ -99,7 +103,7 @@ internal actor SipService: SipServicing {
         )
         
         var callInfo = CallInfo(
-            id: callId,
+            id: localCallId,
             roomName: roomName,
             caller: params.caller,
             callee: calleePlaceholder,
@@ -114,6 +118,10 @@ internal actor SipService: SipServicing {
         
         do {
             // ─── 1. Ask backend to initiate the PSTN leg ──────────────
+            //
+            // Not retried on timeout or 5xx (see `Endpoint.isRepeatable`): the
+            // backend may already have dialed, and a retry would ring the
+            // destination twice.
             let request = SipMakeCallRequest(
                 phoneNumber: params.destinationNumber,
                 roomName: roomName,
@@ -127,28 +135,32 @@ internal actor SipService: SipServicing {
                 retryPolicy: .default
             )
             
-            // ─── Unwrap critical media fields ─────────────────────────
-            guard let roomToken = response.effectiveRoomToken else {
-                throw KasookooError.callFailed(
-                    message: "SIP backend did not return a room token.",
-                    retryable: false
-                )
-            }
-            guard let wsUrl = response.effectiveWsUrl else {
-                throw KasookooError.callFailed(
-                    message: "SIP backend did not return a WebSocket URL.",
-                    retryable: false
-                )
-            }
-            
             let effectiveRoomName = response.effectiveRoomName ?? roomName
             let participantIdentity = response.effectiveParticipantIdentity ?? params.caller.email
             
+            // The user may have hung up while the backend was dialing. The PSTN
+            // leg now exists, so it has to be ended explicitly.
+            if await wasEndedDuringDial(activeCallId) {
+                await endBackendLeg(roomName: effectiveRoomName, participantIdentity: participantIdentity)
+                throw SipDialCancelled()
+            }
+            
+            // ─── Unwrap critical media fields ─────────────────────────
+            guard let roomToken = response.effectiveRoomToken,
+                  let wsUrl = response.effectiveWsUrl else {
+                await endBackendLeg(roomName: effectiveRoomName, participantIdentity: participantIdentity)
+                throw KasookooError.callFailed(
+                    message: response.effectiveRoomToken == nil
+                        ? "SIP backend did not return a room token."
+                        : "SIP backend did not return a WebSocket URL.",
+                    retryable: false
+                )
+            }
+            
             // Re-key to the backend's stable call identifier if provided.
-            let serverCallId = response.effectiveCallId ?? callId
-            if serverCallId != callId {
-                await stateStore.removeCall(callId)
-                callInfo = CallInfo(
+            let serverCallId = response.effectiveCallId ?? localCallId
+            if serverCallId != localCallId {
+                let rekeyed = CallInfo(
                     id: serverCallId,
                     roomName: effectiveRoomName,
                     caller: params.caller,
@@ -160,11 +172,18 @@ internal actor SipService: SipServicing {
                     isPushNotification: false,
                     isSip: true
                 )
-                await stateStore.addCall(callInfo)
+                guard await stateStore.replaceCall(localCallId, with: rekeyed) else {
+                    await endBackendLeg(roomName: effectiveRoomName, participantIdentity: participantIdentity)
+                    throw SipDialCancelled()
+                }
+                callInfo = rekeyed
+                activeCallId = serverCallId
+                callIdAliases[localCallId] = serverCallId
             }
             
-            // Save context for hangup/end.
-            sipCallContexts[serverCallId] = SipCallContext(
+            // Save context for hangup/end. From here on endCall() takes the
+            // normal path and ends the backend leg itself.
+            sipCallContexts[activeCallId] = SipCallContext(
                 roomName: effectiveRoomName,
                 participantIdentity: participantIdentity
             )
@@ -173,8 +192,8 @@ internal actor SipService: SipServicing {
             
             // ─── 2. Join the LiveKit room (this makes audio flow) ─────
             let roomManager = await LiveKitRoomManager(logger: logger)
-            roomManagers[serverCallId] = roomManager
-            await roomManager.setDelegate(self, callId: serverCallId)
+            roomManagers[activeCallId] = roomManager
+            await roomManager.setDelegate(self, callId: activeCallId)
             
             try await roomManager.connect(
                 wsUrl: wsUrl,
@@ -183,46 +202,116 @@ internal actor SipService: SipServicing {
                 localIdentity: participantIdentity
             )
             
+            // endCall() may have run during the connect; it already ended the
+            // backend leg, so only the local room is left to clean up.
+            if await wasEndedDuringDial(activeCallId) {
+                throw SipDialCancelled()
+            }
+            
             // ─── 3. Transition to connecting (waiting for PSTN answer) ─
             // The call becomes `.connected` when the remote participant (the PSTN
             // bridge) joins the room — handled in handleLiveKitEvent below.
-            await stateStore.updateCall(serverCallId) { existing in
+            await stateStore.updateCall(activeCallId) { existing in
                 CallInfo(
                     id: existing.id,
                     roomName: existing.roomName,
                     caller: existing.caller,
                     callee: existing.callee,
-                    state: .connecting,
+                    state: existing.state == .connected ? .connected : .connecting,
                     direction: existing.direction,
                     createdAt: existing.createdAt,
+                    connectedAt: existing.connectedAt,
                     isRecording: existing.isRecording,
                     isPushNotification: existing.isPushNotification,
                     isSip: true
                 )
             }
             
-            let updated = await stateStore.getCall(serverCallId) ?? callInfo
-            logger.info("SIP call connecting (in room, awaiting PSTN answer): \(serverCallId)")
+            let updated = await stateStore.getCall(activeCallId) ?? callInfo
+            logger.info("SIP call connecting (in room, awaiting PSTN answer): \(activeCallId)")
             return updated
             
-        } catch let sdkError as KasookooError {
-            await failSipCall(callId: callInfo.id, error: sdkError)
-            throw sdkError
         } catch {
-            let wrapped = KasookooError.callFailed(
+            let endedByUser: Bool
+            if error is SipDialCancelled {
+                endedByUser = true
+            } else {
+                endedByUser = await wasEndedDuringDial(activeCallId)
+            }
+            
+            if endedByUser {
+                if let manager = roomManagers.removeValue(forKey: activeCallId) {
+                    await manager.disconnect()
+                }
+                sipCallContexts.removeValue(forKey: activeCallId)
+                logger.info("SIP call \(activeCallId) was ended before it connected")
+                throw KasookooError.callFailed(
+                    message: "The SIP call was ended before it connected.",
+                    retryable: false
+                )
+            }
+            
+            let sdkError = (error as? KasookooError) ?? KasookooError.callFailed(
                 message: "Unexpected error dialing SIP: \(error.localizedDescription)",
                 retryable: false,
                 underlyingError: error
             )
-            await failSipCall(callId: callInfo.id, error: wrapped)
-            throw wrapped
+            await failSipCall(callId: activeCallId, error: sdkError)
+            throw sdkError
         }
+    }
+    
+    // MARK: - Dial Cancellation
+    
+    /// Thrown internally when the call was ended while `dial` was suspended.
+    private struct SipDialCancelled: Error {}
+    
+    /// Whether the call has been ended (or is being ended) since dialing began.
+    private func wasEndedDuringDial(_ callId: String) async -> Bool {
+        if endingSipCallIds.contains(callId) { return true }
+        guard let call = await stateStore.getCall(callId) else { return true }
+        return call.state == .ending || call.state.isTerminal
+    }
+    
+    /// Best-effort request to end the backend's PSTN leg.
+    private func endBackendLeg(roomName: String, participantIdentity: String) async {
+        let request = SipEndCallRequest(
+            participantIdentity: participantIdentity,
+            roomName: roomName
+        )
+        do {
+            _ = try await apiClient.send(
+                endpoint: .sipEndCall,
+                body: request,
+                responseType: SipEndResponse.self,
+                retryPolicy: .default
+            )
+        } catch {
+            logger.warning("SIP end API failed: \(error.localizedDescription)")
+        }
+    }
+    
+    /// Maps an id the host may hold (a pre-re-key local id) to the live id.
+    private func canonicalId(_ callId: String) -> String {
+        return callIdAliases[callId] ?? callId
     }
     
     // MARK: - SipServicing: endCall
     
-    func endCall(callId: String) async throws {
+    func endCall(callId requestedId: String) async throws {
+        let callId = canonicalId(requestedId)
+        
         guard let context = sipCallContexts[callId] else {
+            // No backend context yet: the dial request is still in flight.
+            // Mark the call ended now; `dial` sees this when the backend
+            // answers and ends the PSTN leg it just created.
+            if let call = await stateStore.getCall(callId),
+               !call.state.isTerminal,
+               !endingSipCallIds.contains(callId) {
+                logger.info("Hanging up SIP call during dial: \(callId)")
+                await markEnded(callId: callId)
+                return
+            }
             logger.warning("hangup: unknown SIP callId \(callId)")
             throw KasookooError.callFailed(
                 message: "Unknown SIP call ID.",
@@ -248,32 +337,25 @@ internal actor SipService: SipServicing {
         logger.info("Hanging up SIP call: \(callId)")
         
         // Tear down the local LiveKit room first so audio stops immediately.
-        if let manager = roomManagers[callId] {
+        if let manager = roomManagers.removeValue(forKey: callId) {
             await manager.disconnect()
-            roomManagers.removeValue(forKey: callId)
         }
         
-        // Notify the backend to end the PSTN leg.
-        let request = SipEndCallRequest(
-            participantIdentity: context.participantIdentity,
-            roomName: context.roomName
+        // Notify the backend to end the PSTN leg. (The backend removed the
+        // dedicated hangup endpoint; end and hangup were duplicates.)
+        await endBackendLeg(
+            roomName: context.roomName,
+            participantIdentity: context.participantIdentity
         )
         
-        do {
-            // The backend removed the dedicated hangup endpoint; end and hangup
-            // were duplicates, so we now call the end endpoint with the same body.
-            _ = try await apiClient.send(
-                endpoint: .sipEndCall,
-                body: request,
-                responseType: SipEndResponse.self,
-                retryPolicy: .default
-            )
-        } catch {
-            logger.warning("SIP end API failed: \(error.localizedDescription) — cleaning up locally anyway")
-        }
-        
-        // Update state → ended.
-        await stateStore.updateCall(callId) { existing in
+        sipCallContexts.removeValue(forKey: callId)
+        await markEnded(callId: callId)
+        callIdAliases = callIdAliases.filter { $0.value != callId }
+    }
+    
+    /// Moves a call to `.ended` and emits `sip.ended`.
+    private func markEnded(callId: String) async {
+        let endedCall = await stateStore.updateCall(callId) { existing in
             CallInfo(
                 id: existing.id,
                 roomName: existing.roomName,
@@ -290,13 +372,35 @@ internal actor SipService: SipServicing {
             )
         }
         
-        sipCallContexts.removeValue(forKey: callId)
-        
-        if let final = await stateStore.getCall(callId) {
-            await emitSipEvent(EventName.sipEnded, callInfo: final)
+        if let endedCall {
+            await emitSipEvent(EventName.sipEnded, callInfo: endedCall)
         } else {
             await emitSipEndedSimple(callId: callId)
         }
+    }
+    
+    // MARK: - Teardown
+    
+    /// Ends every SIP call this service owns. Used by `disconnect()` and
+    /// `destroy()` so no PSTN leg or microphone outlives the SDK session.
+    func endAll() async {
+        // Connected or connecting calls, plus dials still waiting for the
+        // backend (no context yet): ending those makes `dial` hang up the
+        // PSTN leg as soon as it exists.
+        var callIds = Set(sipCallContexts.keys)
+        for call in await stateStore.allActiveCalls() where call.isSip && call.direction == .outgoing {
+            callIds.insert(call.id)
+        }
+        for callId in callIds {
+            try? await endCall(callId: callId)
+        }
+        let leftovers = roomManagers
+        roomManagers.removeAll()
+        for (_, manager) in leftovers {
+            await manager.disconnect()
+        }
+        sipCallContexts.removeAll()
+        callIdAliases.removeAll()
     }
     
     // MARK: - SipServicing: getStatus
@@ -308,7 +412,8 @@ internal actor SipService: SipServicing {
     // MARK: - In-Call Audio Controls (SIP)
     
     /// Mutes or unmutes the local microphone for a SIP call.
-    func setMuted(_ muted: Bool, callId: String) async throws {
+    func setMuted(_ muted: Bool, callId requestedId: String) async throws {
+        let callId = canonicalId(requestedId)
         guard let manager = roomManagers[callId] else {
             throw KasookooError.callFailed(
                 message: "Cannot toggle mute for unknown or inactive SIP call: \(callId)",
@@ -320,7 +425,8 @@ internal actor SipService: SipServicing {
     }
     
     /// Routes SIP call audio to the loudspeaker (true) or earpiece (false).
-    func setSpeakerEnabled(_ enabled: Bool, callId: String) async throws {
+    func setSpeakerEnabled(_ enabled: Bool, callId requestedId: String) async throws {
+        let callId = canonicalId(requestedId)
         guard let manager = roomManagers[callId] else {
             throw KasookooError.callFailed(
                 message: "Cannot toggle speaker for unknown or inactive SIP call: \(callId)",
@@ -333,7 +439,8 @@ internal actor SipService: SipServicing {
     
     // MARK: - DTMF
     
-    func sendDTMF(_ digit: String, callId: String) async throws {
+    func sendDTMF(_ digit: String, callId requestedId: String) async throws {
+        let callId = canonicalId(requestedId)
         guard let manager = roomManagers[callId] else {
             throw KasookooError.callFailed(
                 message: "Cannot send DTMF for unknown or inactive SIP call: \(callId)",
@@ -346,12 +453,20 @@ internal actor SipService: SipServicing {
     // MARK: - Private: Failure Handling
     
     private func failSipCall(callId: String, error: KasookooError) async {
-        // Cleanup LiveKit.
-        if let manager = roomManagers[callId] {
+        // A room error caused by our own hangup is not a failure.
+        if endingSipCallIds.contains(callId) { return }
+        
+        // Cleanup LiveKit, and end the PSTN leg if the backend created one, so
+        // a failed local join does not leave the destination phone ringing.
+        if let manager = roomManagers.removeValue(forKey: callId) {
             await manager.disconnect()
-            roomManagers.removeValue(forKey: callId)
         }
-        sipCallContexts.removeValue(forKey: callId)
+        if let context = sipCallContexts.removeValue(forKey: callId) {
+            await endBackendLeg(
+                roomName: context.roomName,
+                participantIdentity: context.participantIdentity
+            )
+        }
         
         if await stateStore.getCall(callId) != nil {
             await stateStore.updateCall(callId) { existing in
@@ -370,9 +485,10 @@ internal actor SipService: SipServicing {
                     isSip: true
                 )
             }
+            // Emitted only by whichever path failed the call first (the dial
+            // itself or the room delegate), never twice.
+            await emitSipFailedEvent(callId: callId, error: error)
         }
-        
-        await emitSipFailedEvent(callId: callId, error: error)
     }
     
     // MARK: - LiveKit Event Handling
@@ -381,6 +497,12 @@ internal actor SipService: SipServicing {
         switch event {
         case .remoteParticipantJoined:
             // The PSTN bridge joined the room → the callee has effectively answered.
+            guard let current = await stateStore.getCall(callId),
+                  !current.state.isTerminal,
+                  current.state != .ending,
+                  !endingSipCallIds.contains(callId) else {
+                return
+            }
             await stateStore.updateCall(callId) { existing in
                 CallInfo(
                     id: existing.id,

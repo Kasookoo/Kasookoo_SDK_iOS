@@ -138,11 +138,14 @@ internal struct IntrospectTokenResponse: Decodable, Sendable {
     let scopes: [String]?
     let expiresAt: Int?
     
+    // Only `exp` needs a mapping. `organization_id` is converted by the
+    // decoder's `.convertFromSnakeCase` strategy; declaring it here as
+    // "organization_id" would never match and silently decode nil.
     enum CodingKeys: String, CodingKey {
         case active
         case sub
         case email
-        case organizationId = "organization_id"
+        case organizationId
         case scopes
         case expiresAt = "exp"
     }

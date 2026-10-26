@@ -17,7 +17,8 @@
 //  ─────────────────────────────────────────────────────────────────────────────
 //  TRANSITIONAL / ADDITIVE
 //  ─────────────────────────────────────────────────────────────────────────────
-//  Nothing routes through this yet. `NotificationService` still uses its
+//  Built and populated by `SDKBuilder`, but no module handles pushes yet, so
+//  nothing routes through it. `NotificationService` still uses its
 //  `PushPayloadParser` + switch exactly as before. The router is wired in only
 //  when modules migrate and the hub is converted LAST (Map §14.7), with the
 //  incoming-call path tested at every step. Building it now changes no behaviour.

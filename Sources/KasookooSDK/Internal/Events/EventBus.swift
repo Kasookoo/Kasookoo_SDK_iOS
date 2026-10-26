@@ -15,7 +15,11 @@ internal typealias EventHandler = @Sendable (SDKEvent) -> Void
 /// Services publish events here; the public `KasookooSDK` facade subscribes
 /// and delivers them to consumer handlers on the main thread.
 ///
-/// Implemented as an `actor` for safe concurrent access from any service.
+/// Emission is actor-isolated, so events from all services are delivered one
+/// at a time and in order. Subscription is synchronous (`nonisolated`, guarded
+/// by a lock): a handler registered by `sdk.on(...)` is live before `on(...)`
+/// returns, so an event emitted right afterwards cannot be missed, and an
+/// `off(...)` can never race the registration it cancels.
 internal actor EventBus {
     
     // MARK: - Subscription Storage
@@ -25,8 +29,45 @@ internal actor EventBus {
         let handler: EventHandler
     }
     
-    /// Subscriptions keyed by event name for O(1) lookup during emit.
-    private var subscriptions: [String: [Subscription]] = [:]
+    /// Lock-protected subscription table, keyed by event name for O(1)
+    /// lookup during emit. The lock is only ever held for synchronous
+    /// dictionary work, never across an `await` or a handler call.
+    private final class Registry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var subscriptions: [String: [Subscription]] = [:]
+        
+        func add(_ subscription: Subscription) {
+            lock.lock()
+            defer { lock.unlock() }
+            subscriptions[subscription.token.eventName, default: []].append(subscription)
+        }
+        
+        func remove(_ token: EventToken) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard var list = subscriptions[token.eventName] else { return }
+            list.removeAll { $0.token == token }
+            if list.isEmpty {
+                subscriptions.removeValue(forKey: token.eventName)
+            } else {
+                subscriptions[token.eventName] = list
+            }
+        }
+        
+        func removeAll() {
+            lock.lock()
+            defer { lock.unlock() }
+            subscriptions.removeAll()
+        }
+        
+        func handlers(for eventName: String) -> [EventHandler] {
+            lock.lock()
+            defer { lock.unlock() }
+            return subscriptions[eventName]?.map { $0.handler } ?? []
+        }
+    }
+    
+    private let registry = Registry()
     
     /// Combine subject for consumers who prefer reactive streams.
     ///
@@ -57,42 +98,38 @@ internal actor EventBus {
     
     // MARK: - Subscribe
     
-    /// Subscribes to a specific event by name.
+    /// Subscribes to a specific event by name. Synchronous: the handler is
+    /// registered when this returns.
     ///
     /// - Parameters:
     ///   - eventName: The event name to subscribe to. Use constants from `EventName`.
     ///   - handler: The closure to invoke when the event fires.
     /// - Returns: A token used to unsubscribe.
-    func subscribe(to eventName: String, handler: @escaping EventHandler) -> EventToken {
+    @discardableResult
+    nonisolated func subscribe(to eventName: String, handler: @escaping EventHandler) -> EventToken {
         let token = EventToken(eventName: eventName)
-        let subscription = Subscription(token: token, handler: handler)
-        subscriptions[eventName, default: []].append(subscription)
+        registry.add(Subscription(token: token, handler: handler))
         logger.debug("Subscribed to '\(eventName)' (token: \(token.id))")
         return token
     }
     
     /// Subscribes to ALL events. Useful for logging or debugging.
-    func subscribeToAll(handler: @escaping EventHandler) -> EventToken {
-        return subscribe(to: WildcardEventName, handler: handler)
+    @discardableResult
+    nonisolated func subscribeToAll(handler: @escaping EventHandler) -> EventToken {
+        return subscribe(to: EventBus.wildcardEventName, handler: handler)
     }
     
     // MARK: - Unsubscribe
     
     /// Removes a subscription identified by its token.
-    func unsubscribe(_ token: EventToken) {
-        guard var list = subscriptions[token.eventName] else { return }
-        list.removeAll { $0.token == token }
-        if list.isEmpty {
-            subscriptions.removeValue(forKey: token.eventName)
-        } else {
-            subscriptions[token.eventName] = list
-        }
+    nonisolated func unsubscribe(_ token: EventToken) {
+        registry.remove(token)
         logger.debug("Unsubscribed token: \(token.id)")
     }
     
     /// Removes all subscriptions. Called during SDK shutdown.
-    func unsubscribeAll() {
-        subscriptions.removeAll()
+    nonisolated func unsubscribeAll() {
+        registry.removeAll()
         logger.debug("All event subscriptions cleared")
     }
     
@@ -107,23 +144,18 @@ internal actor EventBus {
         // Notify Combine subscribers
         subject.send(event)
         
-        // Notify name-specific subscribers
-        if let handlers = subscriptions[event.name] {
-            for sub in handlers {
-                sub.handler(event)
-            }
+        // Name-specific subscribers, then wildcard subscribers. Handlers are
+        // snapshotted first so none runs while the registry lock is held.
+        for handler in registry.handlers(for: event.name) {
+            handler(event)
         }
-        
-        // Notify wildcard subscribers
-        if let wildcardHandlers = subscriptions[WildcardEventName] {
-            for sub in wildcardHandlers {
-                sub.handler(event)
-            }
+        for handler in registry.handlers(for: EventBus.wildcardEventName) {
+            handler(event)
         }
     }
+    
+    // MARK: - Wildcard Constant
+    
+    /// Internal sentinel value for wildcard subscriptions.
+    static let wildcardEventName = "__kasookoo.wildcard__"
 }
-
-// MARK: - Wildcard Constant
-
-/// Internal sentinel value for wildcard subscriptions.
-private let WildcardEventName = "__kasookoo.wildcard__"

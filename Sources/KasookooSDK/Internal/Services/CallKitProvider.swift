@@ -15,6 +15,8 @@ import AVFoundation
 internal protocol CallKitProviderDelegate: AnyObject, Sendable {
     func callKitDidAnswerCall(uuid: UUID) async
     func callKitDidEndCall(uuid: UUID) async
+    func callKitDidSetMuted(uuid: UUID, muted: Bool) async
+    func callKitDidPlayDTMF(uuid: UUID, digits: String) async
     func callKitDidActivateAudioSession() async
     func callKitDidDeactivateAudioSession() async
 }
@@ -142,6 +144,12 @@ internal final class CallKitProvider: NSObject, @unchecked Sendable {
         return callIdForUUID(uuid)
     }
     
+    /// Whether a call with this SDK id has already been reported to CallKit.
+    /// Used to de-duplicate a call that arrives over both FCM and PushKit.
+    func isReported(callId: String) -> Bool {
+        return uuidForCallId(callId) != nil
+    }
+    
     // MARK: - Report Incoming Call
     
     /// Reports an incoming call to CallKit. iOS displays the native incoming-call UI.
@@ -157,19 +165,54 @@ internal final class CallKitProvider: NSObject, @unchecked Sendable {
         update.localizedCallerName = info.displayName
         update.hasVideo = false
         update.supportsDTMF = info.isSipCall
-        update.supportsHolding = true
+        // Hold is not implemented (no CXSetHeldCallAction handling and no
+        // LiveKit-side hold), so it is not advertised.
+        update.supportsHolding = false
         update.supportsGrouping = false
         update.supportsUngrouping = false
         
-        logger.info("Reporting incoming call to CallKit: \(info.callId) [\(info.displayName)]")
+        logger.info("Reporting incoming call to CallKit: \(info.callId)")
         
-        try await provider.reportNewIncomingCall(with: uuid, update: update)
+        do {
+            try await provider.reportNewIncomingCall(with: uuid, update: update)
+        } catch {
+            // Rejected by the system (Do Not Disturb, blocked caller, duplicate
+            // UUID…). Forget the mapping so a later push can report again.
+            removeMapping(uuid: uuid)
+            throw error
+        }
+    }
+    
+    /// Reports a call and ends it at once.
+    ///
+    /// Since iOS 13 every PushKit VoIP push must result in a call being
+    /// reported to CallKit, or the system terminates the app and eventually
+    /// stops delivering VoIP pushes to it. A VoIP push that is not an incoming
+    /// call (a cancellation, an unrecognised payload) is satisfied this way.
+    func reportPlaceholderCallAndEnd() async {
+        let uuid = UUID()
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .generic, value: "Call ended")
+        update.localizedCallerName = "Call ended"
+        update.hasVideo = false
+        do {
+            try await provider.reportNewIncomingCall(with: uuid, update: update)
+        } catch {
+            logger.debug("Placeholder call not reported: \(error.localizedDescription)")
+            return
+        }
+        provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
     }
     
     /// Reports that a previously-reported incoming call was cancelled.
+    ///
+    /// Called for every way a call can end outside CallKit (remote hang-up,
+    /// failure, cancellation push, the host app's own end button), so the
+    /// system call UI never outlives the call. A call the user already ended
+    /// from the CallKit UI has no mapping any more and is ignored.
     func reportCallEnded(callId: String, reason: CXCallEndedReason) {
         guard let uuid = uuidForCallId(callId) else {
-            logger.warning("reportCallEnded: unknown callId \(callId)")
+            logger.debug("reportCallEnded: no CallKit call for \(callId)")
             return
         }
         
@@ -177,12 +220,6 @@ internal final class CallKitProvider: NSObject, @unchecked Sendable {
         provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
         
         removeMapping(uuid: uuid)
-    }
-    
-    /// Reports that a call has been connected.
-    func reportCallConnected(callId: String) {
-        guard let uuid = uuidForCallId(callId) else { return }
-        provider.reportOutgoingCall(with: uuid, connectedAt: Date())
     }
     
     // MARK: - Helpers
@@ -235,6 +272,35 @@ extension CallKitProvider: CXProviderDelegate {
         }
         
         removeMapping(uuid: uuid)
+    }
+    
+    func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
+        let uuid: UUID = action.callUUID
+        let muted = action.isMuted
+        action.fulfill()
+        
+        logger.info("CallKit: user \(muted ? "muted" : "unmuted") call \(uuid)")
+        
+        let del = currentDelegate()
+        Task {
+            await del?.callKitDidSetMuted(uuid: uuid, muted: muted)
+        }
+    }
+    
+    func provider(_ provider: CXProvider, perform action: CXPlayDTMFCallAction) {
+        let uuid: UUID = action.callUUID
+        let digits = action.digits
+        action.fulfill()
+        
+        let del = currentDelegate()
+        Task {
+            await del?.callKitDidPlayDTMF(uuid: uuid, digits: digits)
+        }
+    }
+    
+    func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
+        // Hold is not supported (see `supportsHolding`).
+        action.fail()
     }
     
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
