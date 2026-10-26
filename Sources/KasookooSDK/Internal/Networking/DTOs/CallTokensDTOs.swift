@@ -82,7 +82,7 @@ internal struct GetCallTokensRequest: Encodable, Sendable {
 /// ```json
 /// {
 ///   "accessToken": "eyJ...",
-///   "wsUrl": "wss://inapp-test.kasookoo.ai"
+///   "wsUrl": "wss://<livekit-host>"
 /// }
 /// ```
 ///

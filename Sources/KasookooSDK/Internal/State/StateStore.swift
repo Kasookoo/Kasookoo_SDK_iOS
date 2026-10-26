@@ -90,7 +90,7 @@ internal actor StateStore {
     /// Stores the identified user profile and their backend user ID.
     func setIdentifiedUser(_ profile: CallerProfile?, userId: String? = nil) {
         if let profile = profile {
-            logger.debug("User identified: \(profile.email) [userId: \(userId ?? "unknown")]")
+            logger.debug("User identified [userId: \(userId ?? "unknown")]")
             // Cache the email → user_id mapping
             if let userId = userId {
                 emailToUserIdCache[profile.email.lowercased()] = userId
@@ -114,7 +114,7 @@ internal actor StateStore {
     func cacheUserId(email: String, userId: String) {
         let key = email.lowercased()
         emailToUserIdCache[key] = userId
-        logger.debug("Cached userId for \(email): \(userId)")
+        logger.debug("Cached userId: \(userId)")
     }
     
     /// Resolves an email to a user ID, if known.
@@ -160,6 +160,8 @@ internal actor StateStore {
         
         if updated.state.isTerminal {
             activeCalls.removeValue(forKey: callId)
+            // Media credentials are scoped to the call's lifetime.
+            callCredentials.removeValue(forKey: callId)
             logger.debug("Call removed (terminal): \(callId) [state: \(updated.state.rawValue)]")
         } else {
             logger.debug("Call updated: \(callId) [state: \(updated.state.rawValue)]")
@@ -178,6 +180,28 @@ internal actor StateStore {
     
     func getCall(_ callId: String) -> CallInfo? {
         return activeCalls[callId]
+    }
+    
+    /// Atomically replaces the call stored under `oldId` with `newCall`
+    /// (which may carry a different id, e.g. the backend's call id).
+    ///
+    /// Returns `false`, and changes nothing, if the old call is gone or is
+    /// already ending. Doing this in one actor call closes the window in
+    /// which an `end()` could land between "remove old" and "add new" and the
+    /// call would be resurrected under its new id.
+    func replaceCall(_ oldId: String, with newCall: CallInfo) -> Bool {
+        guard let existing = activeCalls[oldId],
+              !existing.state.isTerminal,
+              existing.state != .ending else {
+            return false
+        }
+        activeCalls.removeValue(forKey: oldId)
+        activeCalls[newCall.id] = newCall
+        if let credentials = callCredentials.removeValue(forKey: oldId) {
+            callCredentials[newCall.id] = credentials
+        }
+        logger.debug("Call re-keyed: \(oldId) → \(newCall.id)")
+        return true
     }
     
     // MARK: - Call Media Credentials
@@ -205,6 +229,7 @@ internal actor StateStore {
     func clearAllCalls() {
         let count = activeCalls.count
         activeCalls.removeAll()
+        callCredentials.removeAll()
         if count > 0 {
             logger.debug("Cleared \(count) call(s)")
         }
@@ -233,6 +258,7 @@ internal actor StateStore {
         currentUserId = nil
         emailToUserIdCache.removeAll()
         activeCalls.removeAll()
+        callCredentials.removeAll()
         conversationsCache.removeAll()
         logger.debug("StateStore reset")
     }

@@ -5,12 +5,12 @@ A native iOS communications toolkit that adds voice calling, telephone network c
 ## Features
 
 * **Voice calling.** Live audio sessions between two participants over WebRTC.
-* **Telephone calling (SIP).** Place outbound calls to any standard phone number over the telephone network, with caller id control, optional call recording, and full call lifecycle tracking.
+* **Telephone calling (SIP).** Place outbound calls to any standard phone number over the telephone network, with full call lifecycle tracking. Caller id and recording follow your organization's configuration.
 * **Messaging.** Conversations, history, sending, read state, and unread counts.
 * **In call controls.** Mute and unmute the microphone, switch between loudspeaker and earpiece, and send DTMF tones to navigate interactive voice menus.
 * **Incoming calls.** Device registration and native call presentation through CallKit, so calls arrive even in the background.
 * **Multitenant.** A single integration serves many organizations, with features governed per organization by the backend.
-* **Modern concurrency.** Built with Swift actors and strict Sendable checking for safety by construction.
+* **Modern concurrency.** Built with Swift actors and `Sendable` types, so state is safe to use from any thread.
 
 ## Requirements
 
@@ -33,14 +33,14 @@ A native iOS communications toolkit that adds voice calling, telephone network c
    https://github.com/Kasookoo/Kasookoo_SDK_iOS.git
    ```
 
-3. Choose a version rule, for example **Up to Next Major** from `0.9.0`.
+3. Choose a version rule, for example **Up to Next Major** from `1.0.0`.
 4. Add the **KasookooSDK** library product to your app target.
 
 ### Package.swift
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Kasookoo/Kasookoo_SDK_iOS", from: "0.9.0")
+    .package(url: "https://github.com/Kasookoo/Kasookoo_SDK_iOS", from: "1.0.0")
 ]
 ```
 
@@ -143,11 +143,11 @@ Full guides are available for installation, integration, authentication, and eac
 
 ## Versioning
 
-This SDK follows semantic versioning. Releases in the `0.x` range indicate that the public interface is still stabilizing and may change between minor versions. The interface will be declared stable at `1.0.0`.
+This SDK follows semantic versioning. From `1.0.0` the public interface is stable: breaking changes only ship in a new major version.
 
 ## License
 
-This SDK is commercial software licensed by Kasookoo. Use is permitted only under a valid license agreement with Kasookoo. See the [LICENSE](LICENSE) file for terms. For licensing enquiries, contact Kasookoo.
+This SDK is commercial software licensed by Kasookoo. Use is permitted only under a valid license agreement with Kasookoo, which sets out the terms. For licensing enquiries, contact Kasookoo.
 
 ## Support
 
