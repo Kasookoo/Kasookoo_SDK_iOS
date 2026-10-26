@@ -65,6 +65,7 @@ internal enum SDKBuilder {
             organizationId: config.organizationId,
             logger: logger
         )
+        LogExportWiring.connect(logger: logger, telemetry: telemetry, configuration: config.effectiveTelemetry)
         
         // ─────────────────────────────────────────────────────────────
         // Layer 2: Networking

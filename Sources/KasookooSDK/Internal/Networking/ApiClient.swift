@@ -8,12 +8,14 @@ import Foundation
 /// Provides authenticated tokens to the ApiClient.
 ///
 /// Defined as a protocol to break the circular dependency between
-/// `SessionManager` and `ApiClient`.
-internal protocol AuthTokenProvider: Sendable {
+/// `SessionManager` and `ApiClient`. Class bound so `ApiClient` can hold it
+/// weakly: `SessionManager` already owns the `ApiClient`, and a strong
+/// reference back would keep the whole graph alive after `destroy()`.
+internal protocol AuthTokenProvider: AnyObject, Sendable {
     /// Returns a valid token, refreshing if necessary.
     func ensureValidToken() async throws -> String
     
-    /// Forces a refresh, used after 401/403 retry.
+    /// Forces a refresh, used after a 401.
     func forceRefresh() async throws -> String
 }
 
@@ -24,8 +26,13 @@ internal protocol AuthTokenProvider: Sendable {
 /// - Execute via URLSession
 /// - Decode responses into typed values or `KasookooError`
 /// - Auto-retry on 401 (once) by refreshing the session
-/// - Apply retry policies for network failures
+/// - Apply retry policies for network failures, without ever repeating a
+///   non-idempotent request the server may already have acted on
 /// - Attach correlation headers (X-Request-ID, X-Call-Trace-ID, X-User-ID, X-Feature-Type)
+///
+/// There is exactly one request path. `Endpoint` values are converted to an
+/// `APIRequest` (see `Endpoint.apiRequest`) and go through the same code as
+/// module-owned requests, so auth, retry and telemetry behave identically.
 internal final class ApiClient: @unchecked Sendable {
     
     // MARK: - Properties
@@ -35,8 +42,9 @@ internal final class ApiClient: @unchecked Sendable {
     private let responseDecoder: ResponseDecoder
     private let logger: Logger
     
-    /// Provided after construction to break the circular dependency with SessionManager.
-    private var authProvider: AuthTokenProvider?
+    /// Provided after construction to break the circular dependency with
+    /// SessionManager. Weak on purpose, see `AuthTokenProvider`.
+    private weak var authProvider: AuthTokenProvider?
     private let authProviderLock = NSLock()
     
     /// End user id sent as `X-User-ID` for backend log correlation.
@@ -102,20 +110,27 @@ internal final class ApiClient: @unchecked Sendable {
         return correlationUserId
     }
     
-    // MARK: - Public Request Methods
+    // MARK: - Endpoint Requests
+    //
+    // `bearerToken` sends that exact token and bypasses the auth provider,
+    // including the automatic refresh on 401. The session endpoints (rotate,
+    // revoke) MUST use it: they are called from inside a refresh, and asking
+    // the provider for a token there would make the refresh wait on itself.
     
     /// Sends a request with an `Encodable` body and decodes the response.
     func send<Request: Encodable & Sendable, Response: Decodable & Sendable>(
         endpoint: Endpoint,
         body: Request,
         responseType: Response.Type,
-        retryPolicy: RetryPolicy = .default
+        retryPolicy: RetryPolicy = .default,
+        bearerToken: String? = nil
     ) async throws -> Response {
         return try await performRequest(
-            endpoint: endpoint,
+            request: endpoint.apiRequest,
             body: body,
             responseType: Response.self,
-            retryPolicy: retryPolicy
+            retryPolicy: retryPolicy,
+            explicitBearer: bearerToken
         )
     }
     
@@ -123,114 +138,320 @@ internal final class ApiClient: @unchecked Sendable {
     func send<Response: Decodable & Sendable>(
         endpoint: Endpoint,
         responseType: Response.Type,
-        retryPolicy: RetryPolicy = .default
+        retryPolicy: RetryPolicy = .default,
+        bearerToken: String? = nil
     ) async throws -> Response {
         return try await performRequest(
-            endpoint: endpoint,
+            request: endpoint.apiRequest,
             body: Optional<EmptyBody>.none,
             responseType: Response.self,
-            retryPolicy: retryPolicy
+            retryPolicy: retryPolicy,
+            explicitBearer: bearerToken
         )
     }
     
     /// Sends a request that returns no decoded body (status-only).
     func sendVoid(
         endpoint: Endpoint,
+        retryPolicy: RetryPolicy = .default,
+        bearerToken: String? = nil
+    ) async throws {
+        _ = try await performRequest(
+            request: endpoint.apiRequest,
+            body: Optional<EmptyBody>.none,
+            responseType: EmptyResponse.self,
+            retryPolicy: retryPolicy,
+            explicitBearer: bearerToken
+        )
+    }
+    
+    // MARK: - APIRequest Requests (module-owned requests, Map §14 seam #2)
+    
+    /// Sends an `APIRequest` with an `Encodable` body and decodes the response.
+    func send<Body: Encodable & Sendable, Response: Decodable & Sendable>(
+        apiRequest: APIRequest,
+        body: Body,
+        responseType: Response.Type,
+        retryPolicy: RetryPolicy = .default
+    ) async throws -> Response {
+        return try await performRequest(
+            request: apiRequest,
+            body: body,
+            responseType: Response.self,
+            retryPolicy: retryPolicy,
+            explicitBearer: nil
+        )
+    }
+    
+    /// Sends an `APIRequest` without a body and decodes the response.
+    func send<Response: Decodable & Sendable>(
+        apiRequest: APIRequest,
+        responseType: Response.Type,
+        retryPolicy: RetryPolicy = .default
+    ) async throws -> Response {
+        return try await performRequest(
+            request: apiRequest,
+            body: Optional<EmptyBody>.none,
+            responseType: Response.self,
+            retryPolicy: retryPolicy,
+            explicitBearer: nil
+        )
+    }
+    
+    /// Sends an `APIRequest` that returns no decoded body (status-only).
+    func sendVoid(
+        apiRequest: APIRequest,
         retryPolicy: RetryPolicy = .default
     ) async throws {
         _ = try await performRequest(
-            endpoint: endpoint,
+            request: apiRequest,
             body: Optional<EmptyBody>.none,
             responseType: EmptyResponse.self,
-            retryPolicy: retryPolicy
+            retryPolicy: retryPolicy,
+            explicitBearer: nil
         )
+    }
+    
+    // MARK: - Retry Classification
+    
+    /// URL loading failures that happen before a request can reach the
+    /// server (no route, no DNS, no TCP/TLS connection). Repeating a POST
+    /// after one of these cannot duplicate a side effect.
+    ///
+    /// Deliberately absent: `.timedOut` and `.networkConnectionLost`. Both can
+    /// fire after the server received the request and acted on it.
+    private static let preTransmissionURLErrorCodes: Set<Int> = [
+        URLError.Code.notConnectedToInternet.rawValue,
+        URLError.Code.cannotFindHost.rawValue,
+        URLError.Code.cannotConnectToHost.rawValue,
+        URLError.Code.dnsLookupFailed.rawValue,
+        URLError.Code.dataNotAllowed.rawValue,
+        URLError.Code.internationalRoamingOff.rawValue,
+        URLError.Code.secureConnectionFailed.rawValue
+    ]
+    
+    /// Whether a failed attempt may be repeated.
+    ///
+    /// Repeatable requests (GETs, DELETEs, and POSTs marked
+    /// `isRepeatable`) retry on any retryable error. Other requests retry only
+    /// when the server cannot have acted on them: the request was never
+    /// transmitted, or the server explicitly refused it with 429. A timeout or
+    /// 5xx on `sip/calls/make` may already have dialed a real phone, so it is
+    /// never repeated.
+    static func isRetryable(_ error: Error, isRepeatable: Bool) -> Bool {
+        guard let sdkError = error as? KasookooError, sdkError.retryable else {
+            return false
+        }
+        if sdkError.code == .permissionDenied { return false }
+        // A 401 is never fixed by resending the same request. The provider
+        // path already refreshed once inside `executeOnce`; an explicit-bearer
+        // caller (rotation) must see the 401 at once and bootstrap instead of
+        // sitting through the backoff schedule.
+        if sdkError.code == .sessionExpired || sdkError.httpStatus == 401 { return false }
+        if isRepeatable { return true }
+        return requestNeverReachedServer(sdkError)
+    }
+    
+    /// Whether the error proves the server did not process the request.
+    static func requestNeverReachedServer(_ error: KasookooError) -> Bool {
+        if error.httpStatus == 429 { return true }
+        guard let urlError = error.underlyingError as? URLError else { return false }
+        return preTransmissionURLErrorCodes.contains(urlError.code.rawValue)
     }
     
     // MARK: - Core Request Execution
     
     private func performRequest<Body: Encodable & Sendable, Response: Decodable & Sendable>(
-        endpoint: Endpoint,
+        request: APIRequest,
         body: Body?,
         responseType: Response.Type,
-        retryPolicy: RetryPolicy
+        retryPolicy: RetryPolicy,
+        explicitBearer: String?
     ) async throws -> Response {
         
+        // One id for every attempt of this logical request. It is also sent as
+        // `Idempotency-Key` on POST/PATCH, so a backend that honours the header
+        // can collapse duplicates even if one slips through.
         let requestId = TraceContext.newId()
+        let isRepeatable = request.isRepeatable
         
-        logger.debug("→ \(endpoint.method.rawValue) \(endpoint.path) [reqId: \(requestId)]")
+        logger.debug("→ \(request.method.rawValue) \(ApiClient.route(request.resolvedPath)) [reqId: \(requestId)]")
         
         return try await Retrier.execute(
             policy: retryPolicy,
             isRetryable: { error in
-                guard let sdkError = error as? KasookooError else { return false }
-                // Don't retry permission errors via the network retry path
-                if sdkError.code == .permissionDenied { return false }
-                return sdkError.retryable
+                ApiClient.isRetryable(error, isRepeatable: isRepeatable)
             }
         ) { [weak self] in
             guard let self = self else {
                 throw KasookooError.unknown(message: "ApiClient was deallocated.")
             }
             return try await self.executeOnce(
-                endpoint: endpoint,
+                request: request,
                 body: body,
                 responseType: Response.self,
-                requestId: requestId
+                requestId: requestId,
+                explicitBearer: explicitBearer
             )
         }
     }
     
-    /// Executes a single request attempt with one auto-refresh on 401.
+    /// Executes a single request attempt, with one automatic session refresh
+    /// on 401 when the token came from the auth provider.
     private func executeOnce<Body: Encodable & Sendable, Response: Decodable & Sendable>(
-        endpoint: Endpoint,
+        request: APIRequest,
         body: Body?,
         responseType: Response.Type,
-        requestId: String
+        requestId: String,
+        explicitBearer: String?
     ) async throws -> Response {
         
         // Correlation context for this attempt.
         let trace = TraceContext.current
         let correlationUser = currentCorrelationUserId()
+        let route = ApiClient.route(request.resolvedPath)
         
         // One client span per attempt. It nests under whichever feature span is
         // active, so a slow or failed request is visible inside the user action
         // that caused it.
-        let span = telemetry.startSpan("http.\(endpoint.method.rawValue)", attributes: [
-            "http.route": .string(ApiClient.route(endpoint.path)),
+        let span = telemetry.startSpan("http.\(request.method.rawValue)", attributes: [
+            "http.route": .string(route),
             TelemetryKey.requestId: .string(requestId)
         ])
         defer { span.end() }
         
-        // Get auth token if needed
+        // Resolve the bearer token.
         var authToken: String?
-        if endpoint.requiresAuth {
-            guard let provider = currentAuthProvider() else {
-                throw KasookooError(
-                    code: .sessionInvalid,
-                    message: "Auth provider not configured. Did you call connect()?",
-                    retryable: false
-                )
+        var tokenFromProvider = false
+        if request.requiresAuth {
+            if let explicitBearer {
+                authToken = explicitBearer
+            } else {
+                guard let provider = currentAuthProvider() else {
+                    throw KasookooError(
+                        code: .sessionInvalid,
+                        message: "Auth provider not configured. Did you call connect()?",
+                        retryable: false
+                    )
+                }
+                authToken = try await provider.ensureValidToken()
+                tokenFromProvider = true
             }
-            authToken = try await provider.ensureValidToken()
         }
         
-        // Build the request
+        let (data, response) = try await transmit(
+            request: request,
+            body: body,
+            authToken: authToken,
+            requestId: requestId,
+            trace: trace,
+            correlationUser: correlationUser,
+            span: span,
+            isRetry: false
+        )
+        
+        do {
+            let decoded = try responseDecoder.decode(
+                Response.self,
+                from: data,
+                response: response,
+                requestId: requestId
+            )
+            logger.debug("← \(route) success [reqId: \(requestId)]")
+            span.setAttribute(TelemetryKey.result, .string("ok"))
+            return decoded
+        } catch let error as KasookooError {
+            span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
+            
+            // Only a provider-issued token is refreshed here. An explicit
+            // bearer belongs to the caller (the session layer), which decides
+            // for itself what a 401 means.
+            guard error.code == .sessionExpired,
+                  tokenFromProvider,
+                  let provider = currentAuthProvider() else {
+                span.setError(error.message)
+                throw error
+            }
+            
+            logger.info("Got 401 on \(route), attempting one-time session refresh")
+            
+            let newToken: String
+            do {
+                newToken = try await provider.forceRefresh()
+            } catch {
+                // Refresh failed. Surface the refresh error.
+                logger.warning("Session refresh failed: \(error.localizedDescription)")
+                span.setError("Session refresh failed")
+                logSessionExpired(route: route, reason: "Session refresh failed after a 401.")
+                throw error
+            }
+            
+            let (retryData, retryResponse) = try await transmit(
+                request: request,
+                body: body,
+                authToken: newToken,
+                requestId: requestId,
+                trace: trace,
+                correlationUser: correlationUser,
+                span: span,
+                isRetry: true
+            )
+            
+            if let http = retryResponse as? HTTPURLResponse, http.statusCode == 401 {
+                span.setError("Unauthorized after refresh")
+                logSessionExpired(route: route, reason: "Still unauthorized after refreshing the session.")
+                throw KasookooError(
+                    code: .unauthorized,
+                    message: "Authentication failed after refreshing the session.",
+                    retryable: false,
+                    httpStatus: 401
+                )
+            }
+            
+            let retryDecoded = try responseDecoder.decode(
+                Response.self,
+                from: retryData,
+                response: retryResponse,
+                requestId: requestId
+            )
+            span.setAttribute(TelemetryKey.result, .string("ok_after_refresh"))
+            return retryDecoded
+        }
+    }
+    
+    /// Builds and sends one HTTP request. Transport failures are normalised to
+    /// `KasookooError.networkUnavailable` (keeping the `URLError` so retry
+    /// classification can inspect it); cancellation propagates as-is.
+    private func transmit<Body: Encodable & Sendable>(
+        request: APIRequest,
+        body: Body?,
+        authToken: String?,
+        requestId: String,
+        trace: TraceContext?,
+        correlationUser: String?,
+        span: TelemetrySpanHandle,
+        isRetry: Bool
+    ) async throws -> (Data, URLResponse) {
         var urlRequest = try requestBuilder.build(
-            endpoint: endpoint,
+            apiRequest: request,
             body: body,
             authToken: authToken,
             requestId: requestId
         )
         urlRequest.applyCorrelation(trace: trace, userId: correlationUser)
         
-        logRequest(urlRequest, endpoint: endpoint, requestId: requestId)
+        logRequest(urlRequest, method: request.method, requestId: requestId, isRetry: isRetry)
         
-        // Execute the request
-        let (data, response): (Data, URLResponse)
+        let data: Data
+        let response: URLResponse
         do {
             (data, response) = try await session.data(for: urlRequest)
         } catch {
-            logger.warning("Network error on \(endpoint.path): \(error.localizedDescription)")
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                span.setError("Cancelled")
+                throw CancellationError()
+            }
+            logger.warning("Network error on \(ApiClient.route(request.resolvedPath)): \(error.localizedDescription)")
             span.setError("Network request failed")
             throw KasookooError.networkUnavailable(
                 message: "Network request failed: \(error.localizedDescription)",
@@ -242,88 +463,8 @@ internal final class ApiClient: @unchecked Sendable {
             span.setAttribute("http.status_code", .int(http.statusCode))
         }
         
-        logResponse(data, response: response, endpoint: endpoint, requestId: requestId)
-        
-        // Try to decode the response
-        do {
-            let decoded = try responseDecoder.decode(
-                Response.self,
-                from: data,
-                response: response,
-                requestId: requestId
-            )
-            logger.debug("← \(endpoint.path) success [reqId: \(requestId)]")
-            span.setAttribute(TelemetryKey.result, .string("ok"))
-            return decoded
-        } catch let error as KasookooError {
-            span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
-            
-            // Handle 401: refresh token and retry ONCE
-            if error.code == .sessionExpired,
-               endpoint.requiresAuth,
-               let provider = currentAuthProvider() {
-                logger.info("Got 401 on \(endpoint.path), attempting one-time session refresh")
-                
-                let newToken: String
-                do {
-                    newToken = try await provider.forceRefresh()
-                } catch {
-                    // Refresh failed — propagate the original 401
-                    logger.warning("Session refresh failed: \(error.localizedDescription)")
-                    span.setError("Session refresh failed")
-                    logSessionExpired(
-                        route: ApiClient.route(endpoint.path),
-                        reason: "Session refresh failed after a 401."
-                    )
-                    throw error
-                }
-                
-                // Retry the original request with the new token
-                var retryRequest = try requestBuilder.build(
-                    endpoint: endpoint,
-                    body: body,
-                    authToken: newToken,
-                    requestId: requestId
-                )
-                retryRequest.applyCorrelation(trace: trace, userId: correlationUser)
-                
-                logRequest(retryRequest, endpoint: endpoint, requestId: requestId, isRetry: true)
-                
-                let (retryData, retryResponse) = try await session.data(for: retryRequest)
-                
-                logResponse(retryData, response: retryResponse, endpoint: endpoint, requestId: requestId, isRetry: true)
-                
-                if let http = retryResponse as? HTTPURLResponse {
-                    span.setAttribute("http.status_code", .int(http.statusCode))
-                    if http.statusCode == 401 {
-                        span.setError("Unauthorized after refresh")
-                        logSessionExpired(
-                            route: ApiClient.route(endpoint.path),
-                            reason: "Still unauthorized after refreshing the session."
-                        )
-                        throw KasookooError(
-                            code: .unauthorized,
-                            message: "Authentication failed after refreshing the session.",
-                            retryable: false,
-                            httpStatus: 401
-                        )
-                    }
-                }
-                
-                let retryDecoded = try responseDecoder.decode(
-                    Response.self,
-                    from: retryData,
-                    response: retryResponse,
-                    requestId: requestId
-                )
-                span.setAttribute(TelemetryKey.result, .string("ok_after_refresh"))
-                return retryDecoded
-            }
-            
-            // Not a 401 or no provider — rethrow
-            span.setError(error.message)
-            throw error
-        }
+        logResponse(data, response: response, path: request.resolvedPath, requestId: requestId, isRetry: isRetry)
+        return (data, response)
     }
     
     // MARK: - Wire Logging (DEBUG builds only)
@@ -337,16 +478,15 @@ internal final class ApiClient: @unchecked Sendable {
     
     private func logRequest(
         _ request: URLRequest,
-        endpoint: Endpoint,
+        method: HTTPMethod,
         requestId: String,
-        isRetry: Bool = false
+        isRetry: Bool
     ) {
 #if DEBUG
         let tag = isRetry ? "↻ RETRY ➡️" : "➡️"
-        let method = endpoint.method.rawValue
-        let url = request.url?.absoluteString ?? endpoint.path
+        let url = request.url?.absoluteString ?? "<no url>"
         
-        var lines = ["\(tag) \(method) \(url) [reqId: \(requestId)]"]
+        var lines = ["\(tag) \(method.rawValue) \(url) [reqId: \(requestId)]"]
         
         if let headers = request.allHTTPHeaderFields, !headers.isEmpty {
             let rendered = headers
@@ -370,9 +510,9 @@ internal final class ApiClient: @unchecked Sendable {
     private func logResponse(
         _ data: Data,
         response: URLResponse,
-        endpoint: Endpoint,
+        path: String,
         requestId: String,
-        isRetry: Bool = false
+        isRetry: Bool
     ) {
 #if DEBUG
         let tag = isRetry ? "↻ RETRY ⬅️" : "⬅️"
@@ -383,8 +523,8 @@ internal final class ApiClient: @unchecked Sendable {
         ?? "<non-UTF8 body, \(data.count) bytes>"
         let body = raw.isEmpty ? "<empty>" : raw
         
-        logger.debug("\(tag) \(icon) \(status) \(endpoint.path) [reqId: \(requestId)]\n   Resp: \(body)")
-        print("Log Response \(tag) \(icon) \(status) \(endpoint.path) [reqId: \(requestId)]\n   Resp: \(body)")
+        logger.debug("\(tag) \(icon) \(status) \(path) [reqId: \(requestId)]\n   Resp: \(body)")
+        print("Log Response \(tag) \(icon) \(status) \(path) [reqId: \(requestId)]\n   Resp: \(body)")
 #endif
     }
     
@@ -394,7 +534,7 @@ internal final class ApiClient: @unchecked Sendable {
     ///
     /// Query items carry user ids, room names and paging values. They belong in
     /// explicit span attributes, not silently inside a route label.
-    fileprivate static func route(_ path: String) -> String {
+    static func route(_ path: String) -> String {
         guard let queryStart = path.firstIndex(of: "?") else { return path }
         return String(path[path.startIndex..<queryStart])
     }
@@ -402,7 +542,7 @@ internal final class ApiClient: @unchecked Sendable {
     /// Records a `SESSION_EXPIRED` event. Emitted only when the session could
     /// not be recovered, so it means "the user must re-authenticate" rather
     /// than "a token was refreshed", which happens routinely.
-    fileprivate func logSessionExpired(route: String, reason: String) {
+    private func logSessionExpired(route: String, reason: String) {
         telemetry.log(
             event: TelemetryEvent.sessionExpired,
             message: reason,
@@ -423,231 +563,5 @@ internal final class ApiClient: @unchecked Sendable {
 
 // MARK: - Empty Body Helper
 
+/// Empty body sentinel for requests without a payload.
 private struct EmptyBody: Encodable, Sendable {}
-
-// MARK: - APIRequest support (ADDITIVE — Map §14, seam #2)
-//
-// New send(...) methods that take an `APIRequest` descriptor instead of an
-// `Endpoint`. These mirror the Endpoint-based methods above exactly — same auth
-// flow, same one-time 401 refresh, same retry policy — and reuse RequestBuilder /
-// ResponseDecoder / the auth provider.
-//
-// Same-file extension so it can reach ApiClient's private members (session,
-// requestBuilder, responseDecoder, logger, currentAuthProvider()).
-//
-// TRANSITIONAL: services still call the Endpoint methods. As each migrates to
-// APIRequest, its calls move here. When the last one moves, the Endpoint methods
-// (and the enum) are deleted and this becomes the only path — no logic is
-// duplicated permanently, only during the migration window (Map §14.7).
-
-extension ApiClient {
-
-    /// Sends an `APIRequest` with an `Encodable` body and decodes the response.
-    func send<Body: Encodable & Sendable, Response: Decodable & Sendable>(
-        apiRequest: APIRequest,
-        body: Body,
-        responseType: Response.Type,
-        retryPolicy: RetryPolicy = .default
-    ) async throws -> Response {
-        return try await performRequest(
-            apiRequest: apiRequest,
-            body: body,
-            responseType: Response.self,
-            retryPolicy: retryPolicy
-        )
-    }
-
-    /// Sends an `APIRequest` without a body and decodes the response.
-    func send<Response: Decodable & Sendable>(
-        apiRequest: APIRequest,
-        responseType: Response.Type,
-        retryPolicy: RetryPolicy = .default
-    ) async throws -> Response {
-        return try await performRequest(
-            apiRequest: apiRequest,
-            body: Optional<APIRequestEmptyBodyAC>.none,
-            responseType: Response.self,
-            retryPolicy: retryPolicy
-        )
-    }
-
-    /// Sends an `APIRequest` that returns no decoded body (status-only).
-    func sendVoid(
-        apiRequest: APIRequest,
-        retryPolicy: RetryPolicy = .default
-    ) async throws {
-        _ = try await performRequest(
-            apiRequest: apiRequest,
-            body: Optional<APIRequestEmptyBodyAC>.none,
-            responseType: EmptyResponse.self,
-            retryPolicy: retryPolicy
-        )
-    }
-
-    // MARK: - Core (APIRequest)
-
-    private func performRequest<Body: Encodable & Sendable, Response: Decodable & Sendable>(
-        apiRequest: APIRequest,
-        body: Body?,
-        responseType: Response.Type,
-        retryPolicy: RetryPolicy
-    ) async throws -> Response {
-
-        let requestId = TraceContext.newId()
-        logger.debug("→ \(apiRequest.method.rawValue) \(apiRequest.resolvedPath) [reqId: \(requestId)]")
-
-        return try await Retrier.execute(
-            policy: retryPolicy,
-            isRetryable: { error in
-                guard let sdkError = error as? KasookooError else { return false }
-                if sdkError.code == .permissionDenied { return false }
-                return sdkError.retryable
-            }
-        ) { [weak self] in
-            guard let self = self else {
-                throw KasookooError.unknown(message: "ApiClient was deallocated.")
-            }
-            return try await self.executeOnce(
-                apiRequest: apiRequest,
-                body: body,
-                responseType: Response.self,
-                requestId: requestId
-            )
-        }
-    }
-
-    /// One request attempt with a single auto-refresh on 401 — mirrors the
-    /// Endpoint-based `executeOnce`.
-    private func executeOnce<Body: Encodable & Sendable, Response: Decodable & Sendable>(
-        apiRequest: APIRequest,
-        body: Body?,
-        responseType: Response.Type,
-        requestId: String
-    ) async throws -> Response {
-
-        // Correlation context for this attempt.
-        let trace = TraceContext.current
-        let correlationUser = currentCorrelationUserId()
-
-        let span = telemetry.startSpan("http.\(apiRequest.method.rawValue)", attributes: [
-            "http.route": .string(ApiClient.route(apiRequest.resolvedPath)),
-            TelemetryKey.requestId: .string(requestId)
-        ])
-        defer { span.end() }
-
-        // Auth token if needed.
-        var authToken: String?
-        if apiRequest.requiresAuth {
-            guard let provider = currentAuthProvider() else {
-                throw KasookooError(
-                    code: .sessionInvalid,
-                    message: "Auth provider not configured. Did you call connect()?",
-                    retryable: false
-                )
-            }
-            authToken = try await provider.ensureValidToken()
-        }
-
-        var urlRequest = try requestBuilder.build(
-            apiRequest: apiRequest,
-            body: body,
-            authToken: authToken,
-            requestId: requestId
-        )
-        urlRequest.applyCorrelation(trace: trace, userId: correlationUser)
-
-        // Execute.
-        let (data, response): (Data, URLResponse)
-        do {
-            (data, response) = try await session.data(for: urlRequest)
-        } catch {
-            logger.warning("Network error on \(apiRequest.resolvedPath): \(error.localizedDescription)")
-            span.setError("Network request failed")
-            throw KasookooError.networkUnavailable(
-                message: "Network request failed: \(error.localizedDescription)",
-                underlyingError: error
-            )
-        }
-
-        if let http = response as? HTTPURLResponse {
-            span.setAttribute("http.status_code", .int(http.statusCode))
-        }
-
-        // Decode.
-        do {
-            let decoded = try responseDecoder.decode(
-                Response.self,
-                from: data,
-                response: response,
-                requestId: requestId
-            )
-            logger.debug("← \(apiRequest.resolvedPath) success [reqId: \(requestId)]")
-            span.setAttribute(TelemetryKey.result, .string("ok"))
-            return decoded
-        } catch let error as KasookooError {
-            span.setAttribute(TelemetryKey.errorCode, .string(error.code.rawValue))
-
-            // 401: refresh once and retry.
-            if error.code == .sessionExpired,
-               apiRequest.requiresAuth,
-               let provider = currentAuthProvider() {
-                logger.info("Got 401 on \(apiRequest.resolvedPath), attempting one-time session refresh")
-
-                let newToken: String
-                do {
-                    newToken = try await provider.forceRefresh()
-                } catch {
-                    logger.warning("Session refresh failed: \(error.localizedDescription)")
-                    span.setError("Session refresh failed")
-                    logSessionExpired(
-                        route: ApiClient.route(apiRequest.resolvedPath),
-                        reason: "Session refresh failed after a 401."
-                    )
-                    throw error
-                }
-
-                var retryRequest = try requestBuilder.build(
-                    apiRequest: apiRequest,
-                    body: body,
-                    authToken: newToken,
-                    requestId: requestId
-                )
-                retryRequest.applyCorrelation(trace: trace, userId: correlationUser)
-
-                let (retryData, retryResponse) = try await session.data(for: retryRequest)
-
-                if let http = retryResponse as? HTTPURLResponse {
-                    span.setAttribute("http.status_code", .int(http.statusCode))
-                    if http.statusCode == 401 {
-                        span.setError("Unauthorized after refresh")
-                        logSessionExpired(
-                            route: ApiClient.route(apiRequest.resolvedPath),
-                            reason: "Still unauthorized after refreshing the session."
-                        )
-                        throw KasookooError(
-                            code: .unauthorized,
-                            message: "Authentication failed after refreshing the session.",
-                            retryable: false,
-                            httpStatus: 401
-                        )
-                    }
-                }
-
-                let retryDecoded = try responseDecoder.decode(
-                    Response.self,
-                    from: retryData,
-                    response: retryResponse,
-                    requestId: requestId
-                )
-                span.setAttribute(TelemetryKey.result, .string("ok_after_refresh"))
-                return retryDecoded
-            }
-            span.setError(error.message)
-            throw error
-        }
-    }
-}
-
-/// Empty body sentinel for the APIRequest path (separate name to avoid clashing
-/// with the file's private `EmptyBody`).
-private struct APIRequestEmptyBodyAC: Encodable, Sendable {}

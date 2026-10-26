@@ -37,6 +37,12 @@ public struct TelemetryConfiguration: Sendable {
     public var capturesTraces: Bool
     public var capturesLogs: Bool
 
+    /// The SDK's own log lines at or above this level are exported to Loki
+    /// (redacted, like every other record). `.none` exports only the named
+    /// events (`CALL_FAILED`, `SESSION_EXPIRED`, ...). Independent of
+    /// `LoggingConfig.level`, which only controls the device console.
+    public var exportedLogLevel: LoggingConfig.Level
+
     /// Extra headers sent with every export, for example an ingest key.
     public var additionalHeaders: [String: String]
 
@@ -62,7 +68,8 @@ public struct TelemetryConfiguration: Sendable {
         additionalHeaders: [String: String] = [:],
         scheduleDelay: TimeInterval = 5,
         maxQueueSize: Int = 2048,
-        maxExportBatchSize: Int = 512
+        maxExportBatchSize: Int = 512,
+        exportedLogLevel: LoggingConfig.Level = .info
     ) {
         self.mode = mode
         self.endpoint = endpoint
@@ -74,6 +81,7 @@ public struct TelemetryConfiguration: Sendable {
         self.scheduleDelay = scheduleDelay
         self.maxQueueSize = maxQueueSize
         self.maxExportBatchSize = maxExportBatchSize
+        self.exportedLogLevel = exportedLogLevel
     }
 
     // MARK: Presets

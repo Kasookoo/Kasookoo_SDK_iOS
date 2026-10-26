@@ -19,11 +19,12 @@
 //  ServiceContainer.
 //
 //  ─────────────────────────────────────────────────────────────────────────────
-//  TRANSITIONAL
+//  STATUS
 //  ─────────────────────────────────────────────────────────────────────────────
-//  Additive. Not yet constructed or passed anywhere. `SDKBuilder` still wires
-//  services with individual arguments. All members are `Sendable`, so the context
-//  is `Sendable` and safe to hand to modules across concurrency domains.
+//  Built by `SDKBuilder` and handed to every registered module (messaging
+//  today). Calling, SIP and notifications are still wired with individual
+//  arguments until they migrate. All members are `Sendable`, so the context is
+//  `Sendable` and safe to hand to modules across concurrency domains.
 //
 
 import Foundation

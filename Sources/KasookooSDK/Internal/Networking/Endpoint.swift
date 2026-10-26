@@ -33,7 +33,7 @@ internal enum Endpoint: Sendable {
     // MARK: - Identity (Users)
     
     /// `POST /api/v1/users/identify` — Upsert user by email.
-    /// **Note:** This endpoint uses camelCase (phoneNumber, not phone_number).
+    /// Body: `{organization_id, email, role}` (snake_case, like every other endpoint).
     case identifyUser
     
     // MARK: - WebRTC Calling
@@ -195,6 +195,42 @@ internal enum Endpoint: Sendable {
              .updateDeviceToken,
              .unregisterDeviceToken:
             return .standard
+        }
+    }
+}
+
+// MARK: - APIRequest Conversion
+
+extension Endpoint {
+    
+    /// The equivalent self-describing request. `ApiClient` has a single
+    /// request path, and every `Endpoint` goes through it via this value.
+    /// The body key strategy is snake_case, which is what the Endpoint path
+    /// has always used.
+    var apiRequest: APIRequest {
+        APIRequest(
+            path: path,
+            method: method,
+            requiresAuth: requiresAuth,
+            requiresOrgHeader: requiresOrganizationHeader,
+            timeout: timeoutClass,
+            keyStrategy: .convertToSnakeCase,
+            isRepeatable: isRepeatable
+        )
+    }
+    
+    /// Whether a duplicate of this request is harmless (see
+    /// `APIRequest.isRepeatable`). Only the calls that create a user-visible
+    /// side effect are excluded: minting call tokens rings the callee, and
+    /// SIP make-call dials a real phone.
+    var isRepeatable: Bool {
+        switch self {
+        case .getCallTokens,
+             .getCallTokensAnonymous,
+             .sipMakeCall:
+            return false
+        default:
+            return true
         }
     }
 }

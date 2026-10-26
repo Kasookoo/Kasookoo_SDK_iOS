@@ -27,34 +27,35 @@ internal struct SipMakeCallRequest: Encodable, Sendable {
 
 /// Response for `POST /api/v1/sip/calls/make` on the SDK backend.
 ///
-/// Real backend shape (verified against live response):
+/// Real backend shape (values replaced with placeholders — never paste live
+/// tokens, phone numbers or hostnames into source):
 /// ```json
-//{
-//    "success": true,
-//    "message": "Call initiated successfully",
-//    "data": {
-//        "success": true,
-//        "call_details": {
-//            "participant_identity": "webrtc-user-1785444414",
-//            "room_name": "sip_call_123",
-//            "dialed_number": "+923190835238",
-//            "caller_id": "+442070786177"
-//        },
-//        "room_name": "sip_call_123",
-//        "room_session_id": "RM_rRiF5kCCfFsA",
-//        "dialed_number": "+923190835238",
-//        "caller_id": "+442070786177",
-//        "participant_identity": "webrtc-user-1785444414",
-//        "status": "waiting_for_webrtc",
-//        "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoiSm9obiBEb2UiLCJraW5kIjoidXNlciIsInZpZGVvIjp7InJvb21Kb2luIjp0cnVlLCJyb29tIjoic2lwX2NhbGxfMTIzIiwiY2FuUHVibGlzaCI6dHJ1ZSwiY2FuU3Vic2NyaWJlIjp0cnVlLCJjYW5QdWJsaXNoRGF0YSI6dHJ1ZX0sInN1YiI6IndlYnJ0Yy11c2VyLTE3ODU0NDQ0MTQiLCJpc3MiOiJBUElEbmZKajY3Z2hGVVkiLCJuYmYiOjE3ODU0NDQ0MTQsImV4cCI6MTc4NTQ2NjAxNH0.tUXd9b0bb-CxR4Xhv6SEaB90sBcvPpoNs1CRwhWCjAU",
-//        "ws_url": "wss://inapp-test.kasookoo.ai",
-//        "http_url": "https://inapp-test.kasookoo.ai"
-//    },
-//    "error": null
-//}
+/// {
+///     "success": true,
+///     "message": "Call initiated successfully",
+///     "data": {
+///         "success": true,
+///         "call_details": {
+///             "participant_identity": "webrtc-user-<id>",
+///             "room_name": "sip_call_123",
+///             "dialed_number": "+<destination>",
+///             "caller_id": "+<caller-id>"
+///         },
+///         "room_name": "sip_call_123",
+///         "room_session_id": "RM_<id>",
+///         "dialed_number": "+<destination>",
+///         "caller_id": "+<caller-id>",
+///         "participant_identity": "webrtc-user-<id>",
+///         "status": "waiting_for_webrtc",
+///         "access_token": "<LiveKit JWT>",
+///         "ws_url": "wss://<livekit-host>",
+///         "http_url": "https://<livekit-host>"
+///     },
+///     "error": null
+/// }
 /// ```
 ///
-/// The critical media fields for the SDK are `data.room_token` + `data.wsUrl`,
+/// The critical media fields for the SDK are `data.access_token` + `data.ws_url`,
 /// which the SDK uses to join the LiveKit room so audio can bridge to the PSTN leg.
 internal struct SipMakeCallResponse: Decodable, Sendable {
     let success: Bool?

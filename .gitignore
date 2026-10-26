@@ -23,15 +23,18 @@ AuthKey_*.p8
 *.provisionprofile
 *.cer
 *.p12
-.env
-.env.*
 secrets.plist
 
 # IDE
-.vscode/
 .idea/
 
 # Logs
 *.log
 *.tmp
 *.bak
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
+config.bat
+node_modules

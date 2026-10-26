@@ -32,6 +32,12 @@ internal actor CallService: CallServicing {
     /// the UI (or our own room teardown) triggers the path twice.
     private var endingCallIds: Set<String> = []
     
+    /// Local call ids that were re-keyed to a backend id during `start`.
+    private var callIdAliases: [String: String] = [:]
+    
+    /// Incoming calls whose `accept()` is in flight.
+    private var acceptingCallIds: Set<String> = []
+    
     // MARK: - Init
     
     init(
@@ -62,12 +68,18 @@ internal actor CallService: CallServicing {
             )
         }
         
-        logger.info("Starting call to \(params.callee.email) in room \(params.roomName)")
+        logger.info("Starting call in room \(params.roomName)")
         
-        // Build initial CallInfo
-        let callId = UUID().uuidString
+        // Build initial CallInfo under a local id. It may be re-keyed to the
+        // backend's id below; `activeCallId` always names the live record so
+        // cleanup and failure handling act on the right one.
+        let localCallId = UUID().uuidString
+        var activeCallId = localCallId
+        // Set once the backend has created the call (tokens returned), so a
+        // hang-up during setup knows the callee may already be ringing.
+        var backendRoomName: String?
         var callInfo = CallInfo(
-            id: callId,
+            id: localCallId,
             roomName: params.roomName,
             caller: params.caller,
             callee: params.callee,
@@ -82,6 +94,10 @@ internal actor CallService: CallServicing {
         do {
             // 1. Get tokens from backend
             let tokensResponse = try await fetchCallTokens(params: params)
+            backendRoomName = tokensResponse.roomName ?? params.roomName
+            
+            // The caller may have hung up while the tokens were in flight.
+            try await requireStillLive(activeCallId)
             
             // Unwrap critical fields with clear errors
             guard let callerToken = tokensResponse.effectiveCallerToken else {
@@ -99,11 +115,9 @@ internal actor CallService: CallServicing {
             let effectiveRoomName = tokensResponse.roomName ?? params.roomName
             
             // Use server-provided callId if present
-            let serverCallId = tokensResponse.callId ?? callId
-            if serverCallId != callId {
-                // Re-key in state store
-                await stateStore.removeCall(callId)
-                callInfo = CallInfo(
+            let serverCallId = tokensResponse.callId ?? localCallId
+            if serverCallId != localCallId {
+                let rekeyed = CallInfo(
                     id: serverCallId,
                     roomName: effectiveRoomName,
                     caller: params.caller,
@@ -114,16 +128,27 @@ internal actor CallService: CallServicing {
                     isRecording: params.isCallRecording,
                     isPushNotification: params.isPushNotification
                 )
-                await stateStore.addCall(callInfo)
+                guard await stateStore.replaceCall(localCallId, with: rekeyed) else {
+                    throw CallSetupCancelled()
+                }
+                callInfo = rekeyed
+                activeCallId = serverCallId
+                // A host that grabbed the local id from getActiveCall() can
+                // still end the call with it.
+                callIdAliases[localCallId] = serverCallId
             }
             
             // 2. Transition to ringing
-            callInfo = try await transitionState(callId: serverCallId, to: .ringing) ?? callInfo
+            guard let ringing = try await transitionState(callId: activeCallId, to: .ringing) else {
+                throw CallSetupCancelled()
+            }
+            callInfo = ringing
             
-            // 3. Connect to LiveKit
+            // 3. Connect to LiveKit. The manager is registered before connecting
+            //    so a concurrent end() can tear it down mid-connect.
             let roomManager = await LiveKitRoomManager(logger: logger)
-            roomManagers[serverCallId] = roomManager
-            await roomManager.setDelegate(self, callId: serverCallId)
+            roomManagers[activeCallId] = roomManager
+            await roomManager.setDelegate(self, callId: activeCallId)
             
             try await roomManager.connect(
                 wsUrl: wsUrl,
@@ -132,23 +157,127 @@ internal actor CallService: CallServicing {
                 localIdentity: params.caller.email
             )
             
+            // An end() that arrived during the connect must not leave a live
+            // room with a published microphone behind.
+            try await requireStillLive(activeCallId)
+            
             // 4. Transition to connecting (waiting for callee to join)
-            callInfo = try await transitionState(callId: serverCallId, to: .connecting) ?? callInfo
+            callInfo = try await transitionState(callId: activeCallId, to: .connecting) ?? callInfo
             
             return callInfo
             
-        } catch let sdkError as KasookooError {
-            await failCall(callId: callId, error: sdkError)
-            throw sdkError
         } catch {
-            let wrapped = KasookooError.callFailed(
+            let endedByUser: Bool
+            if error is CallSetupCancelled {
+                endedByUser = true
+            } else {
+                endedByUser = await wasEndedDuringSetup(activeCallId)
+            }
+            
+            if endedByUser {
+                await teardownRoom(callId: activeCallId)
+                // end() may have reached the backend before the call existed
+                // there, in which case the callee would keep ringing. Now that
+                // the backend has created it, tell it again (best effort; a
+                // duplicate caller-end is harmless).
+                if let backendRoomName {
+                    await notifyCallerEnded(
+                        roomName: backendRoomName,
+                        caller: params.caller,
+                        callee: params.callee
+                    )
+                }
+                logger.info("Call \(activeCallId) was ended before it connected")
+                throw KasookooError.callFailed(
+                    message: "The call was ended before it connected.",
+                    retryable: false
+                )
+            }
+            
+            let sdkError = (error as? KasookooError) ?? KasookooError.callFailed(
                 message: "Unexpected error starting call: \(error.localizedDescription)",
                 retryable: false,
                 underlyingError: error
             )
-            await failCall(callId: callId, error: wrapped)
-            throw wrapped
+            await failCall(callId: activeCallId, error: sdkError)
+            throw sdkError
         }
+    }
+    
+    // MARK: - Setup Cancellation
+    
+    /// Thrown internally when the call was ended (or re-keyed away) while
+    /// `start` or `accept` was suspended. Never escapes to the caller.
+    private struct CallSetupCancelled: Error {}
+    
+    /// Throws `CallSetupCancelled` if the call has been ended, or is being
+    /// ended, since setup began.
+    private func requireStillLive(_ callId: String) async throws {
+        if await wasEndedDuringSetup(callId) {
+            throw CallSetupCancelled()
+        }
+    }
+    
+    /// Whether the call is gone, ending, or already terminal.
+    private func wasEndedDuringSetup(_ callId: String) async -> Bool {
+        if endingCallIds.contains(callId) { return true }
+        guard let call = await stateStore.getCall(callId) else { return true }
+        return call.state == .ending || call.state.isTerminal
+    }
+    
+    /// Disconnects and forgets the room manager for a call, if any.
+    private func teardownRoom(callId: String) async {
+        if let manager = roomManagers.removeValue(forKey: callId) {
+            await manager.disconnect()
+        }
+    }
+    
+    /// Maps an id the host may hold (a pre-re-key local id) to the live id.
+    private func canonicalId(_ callId: String) -> String {
+        return callIdAliases[callId] ?? callId
+    }
+    
+    /// Best-effort `caller-end` for an outgoing call.
+    private func notifyCallerEnded(roomName: String, caller: Participant, callee: Participant) async {
+        let request = CallerEndCallRequest(
+            roomName: roomName,
+            caller: ParticipantDTO(from: caller),
+            callee: ParticipantDTO(from: callee)
+        )
+        do {
+            _ = try await apiClient.send(
+                endpoint: .callerEndCall,
+                body: request,
+                responseType: EndCallResponse.self,
+                retryPolicy: .default
+            )
+        } catch {
+            logger.warning("Backend caller-end notification failed: \(error.localizedDescription)")
+        }
+    }
+    
+    // MARK: - Teardown
+    
+    /// Ends every call this service owns. Used by `disconnect()` and
+    /// `destroy()` so no LiveKit room, and no microphone, outlives the SDK
+    /// session. Backend notification is best effort.
+    func endAll() async {
+        // Calls with a media room, plus outgoing calls still being set up
+        // (no room yet): ending those makes `start` abandon them.
+        var callIds = Set(roomManagers.keys)
+        for call in await stateStore.allActiveCalls() where !call.isSip && call.direction == .outgoing {
+            callIds.insert(call.id)
+        }
+        for callId in callIds {
+            try? await end(callId: callId)
+        }
+        // Anything left (e.g. a room whose call record is already gone).
+        let leftovers = roomManagers
+        roomManagers.removeAll()
+        for (_, manager) in leftovers {
+            await manager.disconnect()
+        }
+        callIdAliases.removeAll()
     }
     
     // MARK: - CallServicing: accept
@@ -175,6 +304,15 @@ internal actor CallService: CallServicing {
                 retryable: false
             )
         }
+        
+        // A double tap (or CallKit plus an in-app button) must not join the
+        // room twice and orphan the first connection.
+        guard !acceptingCallIds.contains(callId), roomManagers[callId] == nil else {
+            logger.debug("accept() already in progress for \(callId) — ignoring duplicate")
+            return call
+        }
+        acceptingCallIds.insert(callId)
+        defer { acceptingCallIds.remove(callId) }
         
         logger.info("Accepting incoming call: \(callId)")
         
@@ -212,24 +350,41 @@ internal actor CallService: CallServicing {
                 localIdentity: localIdentity
             )
             
-            logger.info("Incoming call \(callId): joined room '\(call.roomName)' as '\(localIdentity)'")
+            // The caller may have cancelled, or the user ended the call,
+            // while we were joining.
+            try await requireStillLive(callId)
+            
+            logger.info("Incoming call \(callId): joined room '\(call.roomName)'")
             
             // The call becomes `.connected` once the remote participant is seen
             // (handled by handleLiveKitEvent), mirroring the outgoing flow.
             let updated = try await transitionState(callId: callId, to: .connecting)
             return updated ?? call
             
-        } catch let sdkError as KasookooError {
-            await failCall(callId: callId, error: sdkError)
-            throw sdkError
         } catch {
-            let wrapped = KasookooError.callFailed(
+            let endedMeanwhile: Bool
+            if error is CallSetupCancelled {
+                endedMeanwhile = true
+            } else {
+                endedMeanwhile = await wasEndedDuringSetup(callId)
+            }
+            
+            if endedMeanwhile {
+                await teardownRoom(callId: callId)
+                logger.info("Incoming call \(callId) ended while it was being accepted")
+                throw KasookooError.callFailed(
+                    message: "The call ended before it could be accepted.",
+                    retryable: false
+                )
+            }
+            
+            let sdkError = (error as? KasookooError) ?? KasookooError.callFailed(
                 message: "Failed to join room for incoming call: \(error.localizedDescription)",
                 retryable: true,
                 underlyingError: error
             )
-            await failCall(callId: callId, error: wrapped)
-            throw wrapped
+            await failCall(callId: callId, error: sdkError)
+            throw sdkError
         }
     }
     
@@ -282,7 +437,8 @@ internal actor CallService: CallServicing {
     
     // MARK: - CallServicing: end
     
-    func end(callId: String) async throws {
+    func end(callId requestedId: String) async throws {
+        let callId = canonicalId(requestedId)
         guard let call = await stateStore.getCall(callId) else {
             logger.warning("end() called for unknown call: \(callId)")
             return // Silently succeed — call already gone
@@ -308,10 +464,7 @@ internal actor CallService: CallServicing {
         try await transitionState(callId: callId, to: .ending)
         
         // Disconnect LiveKit
-        if let manager = roomManagers[callId] {
-            await manager.disconnect()
-            roomManagers.removeValue(forKey: callId)
-        }
+        await teardownRoom(callId: callId)
         
         // Choose endpoint based on call direction:
         // - Outgoing call hangup by caller → /webrtc/calls/caller-end
@@ -347,11 +500,13 @@ internal actor CallService: CallServicing {
         
         // Transition to ended
         try await transitionState(callId: callId, to: .ended)
+        callIdAliases = callIdAliases.filter { $0.value != callId }
     }
     
     // MARK: - CallServicing: In-Call Audio Controls
     
-    func setMuted(_ muted: Bool, callId: String) async throws {
+    func setMuted(_ muted: Bool, callId requestedId: String) async throws {
+        let callId = canonicalId(requestedId)
         guard let manager = roomManagers[callId] else {
             throw KasookooError.callFailed(
                 message: "Cannot toggle mute for unknown or inactive call: \(callId)",
@@ -363,8 +518,8 @@ internal actor CallService: CallServicing {
         logger.info("Call \(callId) microphone \(muted ? "muted" : "unmuted")")
     }
     
-    func isMuted(callId: String) async -> Bool {
-        guard let manager = roomManagers[callId] else {
+    func isMuted(callId requestedId: String) async -> Bool {
+        guard let manager = roomManagers[canonicalId(requestedId)] else {
             return false
         }
         // muted == microphone NOT enabled.
@@ -372,7 +527,8 @@ internal actor CallService: CallServicing {
         return !micEnabled
     }
     
-    func setSpeakerEnabled(_ enabled: Bool, callId: String) async throws {
+    func setSpeakerEnabled(_ enabled: Bool, callId requestedId: String) async throws {
+        let callId = canonicalId(requestedId)
         guard let manager = roomManagers[callId] else {
             throw KasookooError.callFailed(
                 message: "Cannot toggle speaker for unknown or inactive call: \(callId)",
@@ -381,6 +537,19 @@ internal actor CallService: CallServicing {
         }
         try await manager.setSpeakerEnabled(enabled)
         logger.info("Call \(callId) speaker \(enabled ? "on" : "off")")
+    }
+    
+    /// Sends a DTMF digit on an active call. Used for incoming SIP calls,
+    /// which `CallService` owns once accepted (keypad on the CallKit screen).
+    func sendDTMF(_ digit: String, callId requestedId: String) async throws {
+        let callId = canonicalId(requestedId)
+        guard let manager = roomManagers[callId] else {
+            throw KasookooError.callFailed(
+                message: "Cannot send DTMF for unknown or inactive call: \(callId)",
+                retryable: false
+            )
+        }
+        try await manager.sendDTMF(digit)
     }
     
     // MARK: - CallServicing: getActiveCall
@@ -440,14 +609,13 @@ internal actor CallService: CallServicing {
     
     private func failCall(callId: String, error: KasookooError) async {
         // Cleanup LiveKit
-        if let manager = roomManagers[callId] {
-            await manager.disconnect()
-            roomManagers.removeValue(forKey: callId)
-        }
+        await teardownRoom(callId: callId)
         
-        // Mark failed (force, even if invalid transition)
-        if let current = await stateStore.getCall(callId) {
-            await stateStore.updateCall(callId) { existing in
+        // Mark failed (force, even if invalid transition). A call that is
+        // already being ended is left to `end()`: a room error caused by our
+        // own teardown is not a failure.
+        if let current = await stateStore.getCall(callId), current.state != .ending {
+            let updated = await stateStore.updateCall(callId) { existing in
                 CallInfo(
                     id: existing.id,
                     roomName: existing.roomName,
@@ -463,7 +631,7 @@ internal actor CallService: CallServicing {
                 )
             }
             
-            await emitCallEvent(EventName.callFailed, call: current, extra: [
+            await emitCallEvent(EventName.callFailed, call: updated ?? current, extra: [
                 "errorCode": .string(error.code.rawValue),
                 "errorMessage": .string(error.message)
             ])

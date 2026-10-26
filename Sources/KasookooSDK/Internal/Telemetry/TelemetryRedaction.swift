@@ -111,6 +111,13 @@ internal enum TelemetryRedaction {
             return placeholder
         }
 
+        // Identifiers embedded inside a sentence ("… for jane@example.com",
+        // "dialing +447700900111 failed", a bearer token quoted in an error).
+        // The whole-value checks above only catch a value that IS one.
+        value = replacingMatches(of: embeddedEmail, in: value)
+        value = replacingMatches(of: embeddedPhoneNumber, in: value)
+        value = replacingMatches(of: embeddedJWT, in: value)
+
         value = strippingQueryStrings(in: value)
 
         if value.count > maxValueLength {
@@ -124,6 +131,37 @@ internal enum TelemetryRedaction {
         let normalised = normalise(key)
         if allowedKeys.contains(normalised) { return true }
         return !deniedKeyFragments.contains { normalised.contains($0) }
+    }
+
+    // MARK: - Embedded identifier patterns
+
+    /// An email address anywhere in the text.
+    private static let embeddedEmail = try? NSRegularExpression(
+        pattern: "[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}",
+        options: [.caseInsensitive]
+    )
+
+    /// An E.164-style number anywhere in the text: a `+` followed by 7 to 15
+    /// digits, optionally separated by spaces or dashes. Requiring the `+`
+    /// keeps dates, durations and ids from being mistaken for phone numbers.
+    private static let embeddedPhoneNumber = try? NSRegularExpression(
+        pattern: "\\+[0-9](?:[ -]?[0-9]){6,14}"
+    )
+
+    /// A JWT (three base64url segments, the first starting with `eyJ`).
+    private static let embeddedJWT = try? NSRegularExpression(
+        pattern: "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"
+    )
+
+    private static func replacingMatches(of regex: NSRegularExpression?, in value: String) -> String {
+        guard let regex else { return value }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return regex.stringByReplacingMatches(
+            in: value,
+            options: [],
+            range: range,
+            withTemplate: placeholder
+        )
     }
 
     // MARK: - Helpers

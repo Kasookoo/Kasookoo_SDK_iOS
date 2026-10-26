@@ -19,7 +19,10 @@ public struct SipDialParams: Sendable, Hashable {
     public let caller: Participant
     
     /// Optional caller ID to display to the recipient.
-    /// Falls back to the SIP trunk's default if nil.
+    ///
+    /// - Important: Not yet sent to the backend. The make-call endpoint does
+    ///   not accept a caller id today, so the organization's configured
+    ///   caller id is always used.
     public let callerIdNumber: String?
     
     /// Optional room name to associate this SIP call with.
@@ -27,6 +30,10 @@ public struct SipDialParams: Sendable, Hashable {
     public let roomName: String?
     
     /// Whether to record the call. Defaults to `false`.
+    ///
+    /// - Important: Not yet sent to the backend. The make-call endpoint does
+    ///   not accept a recording flag today; recording follows the
+    ///   organization's configuration.
     public let isCallRecording: Bool
     
     public init(

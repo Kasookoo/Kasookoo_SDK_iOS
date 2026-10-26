@@ -26,9 +26,10 @@
 //  ─────────────────────────────────────────────────────────────────────────────
 //  TRANSITIONAL / ADDITIVE
 //  ─────────────────────────────────────────────────────────────────────────────
-//  Nothing constructs a registry yet. `SDKBuilder` still wires services directly.
-//  The registry is adopted when the first module migrates (next step); until then
-//  it changes no behaviour.
+//  `SDKBuilder` constructs the registry and calls `configureAll` (messaging runs
+//  on it). `startAll`/`stopAll` are not called yet: no module declares a
+//  `capabilityKey` or start/stop work. Wire them into connect/disconnect, fed by
+//  `configuration_availability`, when the first gated module (SIP) migrates.
 //
 //  ─────────────────────────────────────────────────────────────────────────────
 //  USAGE (once wired, illustrative)

@@ -42,10 +42,13 @@ internal enum TelemetryFactory {
         guard configuration.isEnabled else {
             return NoopTelemetry()
         }
+        // The pipeline gets a logger that never exports: its own warnings
+        // ("export failed") must not be queued for export again, which would
+        // loop for as long as the device is offline.
         return OTelTelemetry(
             configuration: configuration,
             organizationId: organizationId,
-            logger: logger
+            logger: logger.makeNonExportingChild(category: "Telemetry")
         )
     }
 }
@@ -201,7 +204,51 @@ internal final class OTelTelemetry: TelemetryReporting, @unchecked Sendable {
         for (key, value) in correlated(attributes) {
             builder.setAttribute(key: key, value: value.otelValue)
         }
-        return OTelSpanHandle(span: builder.startSpan())
+        let span = builder.startSpan()
+
+        // Remember the open span for this feature lifecycle, so log records
+        // written while it runs carry its traceId/spanId (Loki → Tempo link).
+        guard let trace = TraceContext.current, span.context.isValid else {
+            return OTelSpanHandle(span: span)
+        }
+        let context = span.context
+        registerActive(context, callTraceId: trace.callTraceId)
+        return OTelSpanHandle(span: span) { [weak self] in
+            self?.unregisterActive(context, callTraceId: trace.callTraceId)
+        }
+    }
+
+    // MARK: Active spans (log ↔ trace link)
+    //
+    // Spans are not made "current" in OpenTelemetry's context (the global
+    // context belongs to the host app), so the log SDK cannot find them on
+    // its own. They are tracked here per `call_trace_id` instead; the
+    // innermost open span of the caller's lifecycle is attached to each log.
+
+    private let activeSpansLock = NSLock()
+    private var activeSpans: [String: [SpanContext]] = [:]
+
+    private func registerActive(_ context: SpanContext, callTraceId: String) {
+        activeSpansLock.lock()
+        defer { activeSpansLock.unlock() }
+        activeSpans[callTraceId, default: []].append(context)
+    }
+
+    private func unregisterActive(_ context: SpanContext, callTraceId: String) {
+        activeSpansLock.lock()
+        defer { activeSpansLock.unlock() }
+        guard var open = activeSpans[callTraceId] else { return }
+        if let index = open.lastIndex(where: { $0.spanId == context.spanId }) {
+            open.remove(at: index)
+        }
+        activeSpans[callTraceId] = open.isEmpty ? nil : open
+    }
+
+    private func activeSpanContext() -> SpanContext? {
+        guard let trace = TraceContext.current else { return nil }
+        activeSpansLock.lock()
+        defer { activeSpansLock.unlock() }
+        return activeSpans[trace.callTraceId]?.last
     }
 
     func log(
@@ -218,13 +265,37 @@ internal final class OTelTelemetry: TelemetryReporting, @unchecked Sendable {
 
         let body = TelemetryRedaction.sanitize(text: "\(event): \(message)")
 
-        otelLogger.logRecordBuilder()
+        var builder = otelLogger.logRecordBuilder()
             .setTimestamp(Date())
             .setSeverity(severity.otelSeverity)
             .setBody(.string(body))
             .setAttributes(merged.mapValues { $0.otelValue })
             .setEventName(event)
-            .emit()
+        if let spanContext = activeSpanContext() {
+            builder = builder.setSpanContext(spanContext)
+        }
+        builder.emit()
+    }
+
+    func logMessage(
+        _ message: String,
+        severity: TelemetrySeverity,
+        attributes: [String: TelemetryAttribute]
+    ) {
+        guard configuration.capturesLogs else { return }
+
+        var merged = correlated(attributes)
+        merged[TelemetryKey.level] = .string(severity.levelName)
+
+        var builder = otelLogger.logRecordBuilder()
+            .setTimestamp(Date())
+            .setSeverity(severity.otelSeverity)
+            .setBody(.string(TelemetryRedaction.sanitize(text: message)))
+            .setAttributes(merged.mapValues { $0.otelValue })
+        if let spanContext = activeSpanContext() {
+            builder = builder.setSpanContext(spanContext)
+        }
+        builder.emit()
     }
 
     func setUserId(_ userId: String?) {
@@ -389,8 +460,12 @@ private final class OTelSpanHandle: TelemetrySpanHandle, @unchecked Sendable {
     private let lock = NSLock()
     private var hasEnded = false
 
-    init(span: Span) {
+    /// Called once, after the span ends (unregisters it from the active list).
+    private let onEnd: (() -> Void)?
+
+    init(span: Span, onEnd: (() -> Void)? = nil) {
         self.span = span
+        self.onEnd = onEnd
     }
 
     func setAttribute(_ key: String, _ value: TelemetryAttribute) {
@@ -423,10 +498,15 @@ private final class OTelSpanHandle: TelemetrySpanHandle, @unchecked Sendable {
 
     func end() {
         lock.lock()
-        defer { lock.unlock() }
-        guard !hasEnded else { return }
+        guard !hasEnded else {
+            lock.unlock()
+            return
+        }
         hasEnded = true
         span.end()
+        lock.unlock()
+        // Outside the lock: it takes the reporter's lock.
+        onEnd?()
     }
 }
 

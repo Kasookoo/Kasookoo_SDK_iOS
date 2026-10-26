@@ -108,7 +108,7 @@ internal final class LiveKitRoomManager: NSObject {
         self.roomName = roomName
         self.localIdentity = localIdentity
         
-        logger.info("LiveKit: connecting to room '\(roomName)' as '\(localIdentity)'")
+        logger.info("LiveKit: connecting to room '\(roomName)'")
         
         // Configure audio session for VoIP
         try configureAudioSession()
@@ -136,9 +136,13 @@ internal final class LiveKitRoomManager: NSObject {
     }
     
     /// Disconnects from the current room.
+    ///
+    /// Also acts while a connect or reconnect is still in progress. Checking
+    /// only for `.connected` let a hang-up during setup leave the room to
+    /// finish connecting and publish the microphone afterwards.
     func disconnect() async {
-        guard isConnected else {
-            logger.debug("LiveKit: disconnect called but not connected")
+        guard room.connectionState != .disconnected else {
+            logger.debug("LiveKit: disconnect called but already disconnected")
             return
         }
         logger.info("LiveKit: disconnecting from '\(roomName ?? "unknown")'")
@@ -168,7 +172,16 @@ internal final class LiveKitRoomManager: NSObject {
     // MARK: - Speaker Control
     
     /// Routes audio to the loudspeaker (true) or earpiece (false).
+    ///
+    /// LiveKit manages the `AVAudioSession` itself and re-applies its category
+    /// whenever the audio engine starts. With its default speaker preference
+    /// that category includes `.defaultToSpeaker`, so a plain
+    /// `overrideOutputAudioPort(.none)` fell straight back to the speaker and
+    /// the earpiece could never be selected. The preference is therefore set on
+    /// LiveKit (which reconfigures the session), and the port override is
+    /// applied as well so the change is immediate.
     func setSpeakerEnabled(_ enabled: Bool) throws {
+        AudioManager.shared.isSpeakerOutputPreferred = enabled
         let session = AVAudioSession.sharedInstance()
         do {
             try session.overrideOutputAudioPort(enabled ? .speaker : .none)
@@ -285,7 +298,7 @@ extension LiveKitRoomManager: RoomDelegate {
     nonisolated func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
         let identity = participant.identity?.stringValue ?? "unknown"
         Task { @MainActor in
-            self.logger.info("LiveKit: remote participant joined: \(identity)")
+            self.logger.info("LiveKit: remote participant joined")
             await self.delegate?.roomManager(self, didReceiveEvent: .remoteParticipantJoined(identity: identity))
         }
     }
@@ -293,7 +306,7 @@ extension LiveKitRoomManager: RoomDelegate {
     nonisolated func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
         let identity = participant.identity?.stringValue ?? "unknown"
         Task { @MainActor in
-            self.logger.info("LiveKit: remote participant left: \(identity)")
+            self.logger.info("LiveKit: remote participant left")
             await self.delegate?.roomManager(self, didReceiveEvent: .remoteParticipantLeft(identity: identity))
         }
     }

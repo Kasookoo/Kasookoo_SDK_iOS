@@ -65,11 +65,9 @@ internal struct RegisterDeviceTokenResponse: Decodable, Sendable {
     let deviceId: String?
     let message: String?
     
-    enum CodingKeys: String, CodingKey {
-        case success
-        case deviceId = "device_id"
-        case message
-    }
+    // No CodingKeys: `.convertFromSnakeCase` maps `device_id` → `deviceId`.
+    // An explicit `deviceId = "device_id"` key never matches under that
+    // strategy and always decoded nil.
 }
 
 // MARK: - Update Device Token

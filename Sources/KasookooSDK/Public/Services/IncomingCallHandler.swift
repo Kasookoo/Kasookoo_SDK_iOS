@@ -32,7 +32,7 @@ import Foundation
 /// }
 ///
 /// // Register the handler:
-/// sdk.notifications.incomingCallHandler = MyCallHandler()
+/// try await sdk.notifications.setIncomingCallHandler(MyCallHandler())
 /// ```
 public protocol IncomingCallHandler: AnyObject, Sendable {
     

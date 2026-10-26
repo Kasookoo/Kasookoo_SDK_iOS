@@ -26,15 +26,15 @@ import Foundation
 ///     environment: .production
 /// ))
 ///
-/// // 2. Identify the user (optional)
+/// // 2. Connect (acquires session token)
+/// try await sdk.connect()
+///
+/// // 3. Identify the user
 /// try await sdk.identify(callerProfile: CallerProfile(
 ///     name: "Jane Doe",
 ///     email: "jane@example.com",
 ///     phoneNumber: "+447700900111"
 /// ))
-///
-/// // 3. Connect (acquires session token)
-/// try await sdk.connect()
 ///
 /// // 4. Subscribe to events
 /// let token = sdk.on(EventName.callIncoming) { event in
@@ -51,9 +51,9 @@ import Foundation
 ///
 /// ## Thread Safety
 ///
-/// All public methods are async and safe to call from any thread.
+/// All public methods are safe to call from any thread.
 /// Event handlers registered via `on(_:handler:)` are invoked on the **main actor**,
-/// so they can update UI directly without dispatching.
+/// in emission order, so they can update UI directly without dispatching.
 public final class KasookooSDK: @unchecked Sendable {
     
     // MARK: - Internal State
@@ -62,9 +62,15 @@ public final class KasookooSDK: @unchecked Sendable {
     /// Access only via lock-protected sync helpers below.
     private var assembled: AssembledSDK?
     
-    /// Tracks active event subscriptions for cleanup.
-    /// Maps placeholder token UUID → real EventBus token.
-    private var subscriptions: [UUID: EventToken] = [:]
+    /// One consumer subscription: the bus token plus the stream that carries
+    /// its events to the main actor in order.
+    private struct Delivery {
+        let token: EventToken
+        let continuation: AsyncStream<SDKEvent>.Continuation
+    }
+    
+    /// Active event subscriptions, keyed by token id, for `off()` and cleanup.
+    private var subscriptions: [UUID: Delivery] = [:]
     
     /// Synchronous lock guarding `assembled` and `subscriptions`.
     /// IMPORTANT: This lock is ONLY used inside non-async helper methods
@@ -80,13 +86,21 @@ public final class KasookooSDK: @unchecked Sendable {
     public init() {}
     
     deinit {
-        // Best-effort cleanup if consumer didn't call destroy()
-        let assembledRef = readAssembled()
-        if let a = assembledRef {
-            // Can't await in deinit, but a detached Task can fire off cleanup.
+        // Best-effort cleanup if the consumer didn't call destroy(). Nothing
+        // here may outlive the instance: no media room, no microphone, no
+        // refresh timer.
+        for (_, delivery) in subscriptions {
+            delivery.continuation.finish()
+        }
+        if let a = assembled {
+            a.eventBus.unsubscribeAll()
             Task.detached {
+                await a.callService.endAll()
+                await a.sipService.endAll()
+                await a.sessionManager.disconnect()
                 await a.notificationService.setIncomingCallHandler(nil)
-                await a.eventBus.unsubscribeAll()
+                a.logger.setExport(level: .none, sink: nil)
+                a.telemetry.shutdown()
             }
         }
     }
@@ -124,25 +138,25 @@ public final class KasookooSDK: @unchecked Sendable {
         return true
     }
     
-    /// Stores a subscription token mapping.
-    private func storeSubscription(placeholderId: UUID, realToken: EventToken) {
+    /// Stores a subscription.
+    private func storeSubscription(_ delivery: Delivery) {
         lock.lock()
         defer { lock.unlock() }
-        subscriptions[placeholderId] = realToken
+        subscriptions[delivery.token.id] = delivery
     }
     
-    /// Removes and returns a subscription token mapping.
-    private func removeSubscription(placeholderId: UUID) -> EventToken? {
+    /// Removes and returns a subscription.
+    private func removeSubscription(id: UUID) -> Delivery? {
         lock.lock()
         defer { lock.unlock() }
-        return subscriptions.removeValue(forKey: placeholderId)
+        return subscriptions.removeValue(forKey: id)
     }
     
-    /// Removes all subscription tokens. Returns the previous map for cleanup.
-    private func clearSubscriptions() -> [UUID: EventToken] {
+    /// Removes all subscriptions. Returns them for cleanup.
+    private func clearSubscriptions() -> [Delivery] {
         lock.lock()
         defer { lock.unlock() }
-        let current = subscriptions
+        let current = Array(subscriptions.values)
         subscriptions.removeAll()
         return current
     }
@@ -213,7 +227,16 @@ public final class KasookooSDK: @unchecked Sendable {
             await emitSDKEvent(
                 EventName.sdkError,
                 data: [
-                    "errorMessage": .string(error.localizedDescription)
+                    "errorCode": .string(sdkError.code.rawValue),
+                    "errorMessage": .string(sdkError.message)
+                ]
+            )
+            await emitSDKEvent(
+                EventName.sdkConnectionChanged,
+                data: [
+                    "state": .string("error"),
+                    "errorCode": .string(sdkError.code.rawValue),
+                    "errorMessage": .string(sdkError.message)
                 ]
             )
             throw error
@@ -233,8 +256,9 @@ public final class KasookooSDK: @unchecked Sendable {
     
     /// Disconnects from the backend.
     ///
-    /// Revokes the session, stops the refresh scheduler, and clears active calls.
-    /// The SDK remains initialized and can be reconnected with `connect()`.
+    /// Ends any active calls (disconnecting their media rooms), revokes the
+    /// session, and stops the refresh scheduler. The SDK remains initialized
+    /// and can be reconnected with `connect()`.
     public func disconnect() async throws {
         let bundle = try requireAssembled()
         
@@ -244,10 +268,15 @@ public final class KasookooSDK: @unchecked Sendable {
             data: ["state": .string("disconnecting")]
         )
         
+        // Calls first, while the session is still valid, so the backend is
+        // told each call ended and no LiveKit room keeps the microphone open.
+        await bundle.callService.endAll()
+        await bundle.sipService.endAll()
+        
         // Tell SessionManager to revoke + clear
         await bundle.sessionManager.disconnect()
         
-        // Clear active calls
+        // Clear any remaining call records (e.g. unanswered incoming calls)
         await bundle.stateStore.clearAllCalls()
         
         // Stop correlating, then export whatever the batch processors still
@@ -273,21 +302,26 @@ public final class KasookooSDK: @unchecked Sendable {
         // Atomically extract the bundle and clear our subscriptions map.
         // After this, future calls to requireAssembled() will throw.
         let bundle = writeAssembled(nil)
-        let subs = clearSubscriptions()
+        let deliveries = clearSubscriptions()
         
-        guard let bundle = bundle else { return }
-        
-        // Disconnect if connected
-        let state = await bundle.stateStore.getState()
-        if case .connected = state {
-            await bundle.sessionManager.disconnect()
+        guard let bundle = bundle else {
+            deliveries.forEach { $0.continuation.finish() }
+            return
         }
+        
+        // End calls and the session whatever state the SDK is in. Checking
+        // for `.connected` only left the refresh timer running (and minting
+        // tokens) after destroy when the SDK was connecting or in error.
+        await bundle.callService.endAll()
+        await bundle.sipService.endAll()
+        await bundle.sessionManager.disconnect()
         
         // Unsubscribe all events
-        for (_, token) in subs {
-            await bundle.eventBus.unsubscribe(token)
+        for delivery in deliveries {
+            bundle.eventBus.unsubscribe(delivery.token)
+            delivery.continuation.finish()
         }
-        await bundle.eventBus.unsubscribeAll()
+        bundle.eventBus.unsubscribeAll()
         
         // Clear state
         await bundle.stateStore.reset()
@@ -295,8 +329,13 @@ public final class KasookooSDK: @unchecked Sendable {
         // Clear notification handler
         await bundle.notificationService.setIncomingCallHandler(nil)
         
+        // Drop module registrations
+        bundle.pushRouter.removeAll()
+        bundle.container.removeAll()
+        
         // Flush and stop the telemetry pipeline last, so anything emitted
         // during teardown still leaves the device.
+        bundle.logger.setExport(level: .none, sink: nil)
         bundle.telemetry.shutdown()
     }
     
@@ -367,10 +406,12 @@ public final class KasookooSDK: @unchecked Sendable {
         // A successful response with no user_id would leave the SDK in a half
         // identified state that messaging and calling cannot use, so fail cleanly
         // instead of caching an identity without an id.
+        // (No email in the log line or the error: both can leave the device,
+        // the error via telemetry.)
         guard let userId = response.effectiveUserId else {
-            bundle.logger.warning("Identify returned no user_id for \(callerProfile.email)")
+            bundle.logger.warning("Identify returned no user_id")
             throw KasookooError.userNotFound(
-                message: "Identify did not return a user id for \(callerProfile.email). The user may not be registered with this organization."
+                message: "Identify did not return a user id. The user may not be registered with this organization."
             )
         }
 
@@ -382,7 +423,7 @@ public final class KasookooSDK: @unchecked Sendable {
 
         // Cache email → user_id so subsequent messaging.send() can resolve emails.
         await bundle.stateStore.setIdentifiedUser(callerProfile, userId: userId)
-        bundle.logger.info("User identified: \(callerProfile.email) [userId: \(userId)]")
+        bundle.logger.info("User identified [userId: \(userId)]")
     }
     /// Clears the identified user.
     ///
@@ -451,8 +492,13 @@ public final class KasookooSDK: @unchecked Sendable {
     
     /// Subscribes to a specific event by name.
     ///
-    /// Handlers are invoked on the **main actor**, so UI updates inside the handler
+    /// Handlers are invoked on the **main actor**, one at a time and in the
+    /// order the events were emitted, so UI updates inside the handler
     /// require no additional dispatching.
+    ///
+    /// The subscription is live when this method returns. Call it after
+    /// `initialize(config:)`: before initialization there is nothing to
+    /// subscribe to and the returned token is inert.
     ///
     /// - Parameters:
     ///   - eventName: The event name. See `EventName` for available constants.
@@ -463,49 +509,46 @@ public final class KasookooSDK: @unchecked Sendable {
         _ eventName: String,
         handler: @escaping @MainActor (SDKEvent) -> Void
     ) -> EventToken {
-        // Generate a placeholder token; the real subscription happens async.
-        // We give back a token immediately so the caller can store it.
-        let placeholderToken = EventToken(eventName: eventName)
-        
-        Task { [weak self] in
-            guard let self = self,
-                  let bundle = self.readAssembled() else {
-                return
-            }
-            
-            // Wrap consumer handler to hop to MainActor
-            let wrapped: EventHandler = { event in
-                Task { @MainActor in
-                    handler(event)
-                }
-            }
-            
-            let token = await bundle.eventBus.subscribe(to: eventName, handler: wrapped)
-            
-            // Store the actual token under the placeholder's UUID for later off()
-            self.storeSubscription(placeholderId: placeholderToken.id, realToken: token)
+        guard let bundle = readAssembled() else {
+            return EventToken(eventName: eventName)
         }
         
-        return placeholderToken
+        // One stream per subscription, drained by one main-actor task. A task
+        // per event (the previous approach) gave no ordering guarantee, so
+        // `call.connected` could be handled before `call.ringing`.
+        var capturedContinuation: AsyncStream<SDKEvent>.Continuation?
+        let stream = AsyncStream<SDKEvent> { capturedContinuation = $0 }
+        guard let continuation = capturedContinuation else {
+            return EventToken(eventName: eventName)
+        }
+        
+        Task { @MainActor in
+            for await event in stream {
+                handler(event)
+            }
+        }
+        
+        let token = bundle.eventBus.subscribe(to: eventName) { event in
+            continuation.yield(event)
+        }
+        storeSubscription(Delivery(token: token, continuation: continuation))
+        return token
     }
     
     /// Subscribes to all events. Useful for logging or analytics.
     @discardableResult
     public func onAll(handler: @escaping @MainActor (SDKEvent) -> Void) -> EventToken {
-        return on("__kasookoo.wildcard__", handler: handler)
+        return on(EventBus.wildcardEventName, handler: handler)
     }
     
-    /// Unsubscribes a previously-registered handler.
+    /// Unsubscribes a previously-registered handler. Takes effect immediately:
+    /// no event emitted after this returns reaches the handler.
     public func off(_ token: EventToken) {
-        guard let realToken = removeSubscription(placeholderId: token.id) else {
+        guard let delivery = removeSubscription(id: token.id) else {
             return
         }
-        
-        Task { [weak self] in
-            guard let self = self,
-                  let bundle = self.readAssembled() else { return }
-            await bundle.eventBus.unsubscribe(realToken)
-        }
+        readAssembled()?.eventBus.unsubscribe(delivery.token)
+        delivery.continuation.finish()
     }
     
     // MARK: - Internal Helpers
@@ -536,32 +579,12 @@ public final class KasookooSDK: @unchecked Sendable {
     
     // MARK: - JWT Helpers
     
-    /// Extracts the `organization_id` claim from a session JWT.
-    ///
-    /// The token is a standard JWT: `header.payload.signature`, each segment
-    /// base64url-encoded. We decode only the payload (no signature verification —
-    /// the backend already verified it when issuing; we just need the claim). This
-    /// lets `identify` send exactly the org the session was authenticated for,
-    /// avoiding the 403 mismatch.
+    /// Extracts the `organization_id` claim from a session JWT, so `identify`
+    /// sends exactly the org the session was authenticated for (avoiding the
+    /// backend's 403 on a mismatch). Payload decode only, see `JWTClaims`.
     ///
     /// Returns nil if the token is malformed or has no `organization_id` claim.
     static func organizationId(fromJWT token: String) -> String? {
-        let segments = token.split(separator: ".")
-        guard segments.count >= 2 else { return nil }
-        
-        var base64 = String(segments[1])
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        // Pad to a multiple of 4 for base64 decoding.
-        while base64.count % 4 != 0 { base64 += "=" }
-        
-        guard let data = Data(base64Encoded: base64),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let orgId = json["organization_id"] as? String,
-              !orgId.isEmpty
-        else {
-            return nil
-        }
-        return orgId
+        return JWTClaims.string("organization_id", in: token)
     }
 }

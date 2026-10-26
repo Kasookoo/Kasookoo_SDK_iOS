@@ -18,12 +18,12 @@
 //  module's request without knowing which endpoints exist.
 //
 //  ─────────────────────────────────────────────────────────────────────────────
-//  TRANSITIONAL
+//  STATUS
 //  ─────────────────────────────────────────────────────────────────────────────
-//  This is ADDITIVE. `Endpoint` still exists and every service still uses it — the
-//  two paths run side by side. Services migrate to `APIRequest` one at a time, each
-//  verified independently; `Endpoint` is removed only once no caller remains. Until
-//  then nothing about the existing calling/SIP/messaging behaviour changes.
+//  `ApiClient` sends only `APIRequest`s. Messaging builds its own; the remaining
+//  services still use `Endpoint` cases, which convert via `Endpoint.apiRequest`.
+//  As each service migrates it defines its own requests and its `Endpoint` cases
+//  are deleted. There is a single request path either way.
 //
 
 import Foundation
@@ -89,6 +89,14 @@ internal struct APIRequest: Sendable {
     /// struct stays trivially `Sendable`. Folded into the URL by `resolvedPath`.
     let queryItems: [(name: String, value: String)]?
 
+    /// Whether sending this request twice is harmless, so a timeout or 5xx
+    /// may be retried even though the server might already have processed it.
+    ///
+    /// Defaults to the HTTP method's idempotency. Set `true` for a POST that is
+    /// an upsert or an end/cleanup call; leave `false` for anything that
+    /// creates a user-visible side effect (dialing, ringing, sending a message).
+    let isRepeatable: Bool
+
     init(
         path: String,
         method: HTTPMethod,
@@ -96,7 +104,8 @@ internal struct APIRequest: Sendable {
         requiresOrgHeader: Bool = false,
         timeout: TimeoutClass = .standard,
         keyStrategy: RequestKeyStrategy = .convertToSnakeCase,
-        queryItems: [(name: String, value: String)]? = nil
+        queryItems: [(name: String, value: String)]? = nil,
+        isRepeatable: Bool? = nil
     ) {
         self.path = path
         self.method = method
@@ -105,6 +114,7 @@ internal struct APIRequest: Sendable {
         self.timeout = timeout
         self.keyStrategy = keyStrategy
         self.queryItems = queryItems
+        self.isRepeatable = isRepeatable ?? method.isIdempotent
     }
 
     /// The relative path with any `queryItems` appended.
