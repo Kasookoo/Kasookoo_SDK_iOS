@@ -221,6 +221,26 @@ internal actor NotificationService: NotificationServicing {
         )
     }
     
+    func unregisterDevice(fcmToken: String) async throws {
+        guard let profile = await stateStore.identifiedUser else {
+            throw KasookooError.configInvalid(
+                "Cannot unregister push: no user is identified."
+            )
+        }
+        
+        guard let userId = await stateStore.resolveUserId(forEmail: profile.email) else {
+            throw KasookooError.configInvalid(
+                "Cannot unregister push: the backend user id of the identified user is not known."
+            )
+        }
+        
+        try await unregisterDevice(
+            fcmToken: fcmToken,
+            userId: userId,
+            userType: profile.type
+        )
+    }
+    
     // MARK: - Push Handling
     
     @discardableResult

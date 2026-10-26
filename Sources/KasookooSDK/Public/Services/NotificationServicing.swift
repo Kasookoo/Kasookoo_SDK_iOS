@@ -115,6 +115,19 @@ public protocol NotificationServicing: Sendable {
         userType: ParticipantType
     ) async throws
     
+    /// Unregisters this device for the currently identified user, resolving
+    /// the backend user id automatically — the counterpart of
+    /// `registerDevice(fcmToken:deviceInfo:)`.
+    ///
+    /// Call on logout **before** `disconnect()`, while the session and the
+    /// identity are still valid. Without it the backend keeps delivering the
+    /// previous user's calls to this device.
+    ///
+    /// - Parameter fcmToken: The FCM token that was registered.
+    /// - Throws: `KasookooError.configInvalid` if no user is identified or the
+    ///   backend user id is unknown, or a network error.
+    func unregisterDevice(fcmToken: String) async throws
+    
     // MARK: - Push Handling
     
     /// Processes a regular (non-VoIP) push notification payload.
