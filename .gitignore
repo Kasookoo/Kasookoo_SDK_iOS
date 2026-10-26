@@ -16,6 +16,7 @@ xcuserdata/
 
 # Sensitive files - NEVER commit
 GoogleService-Info.plist
+temp_auto_push.bat
 google-services.json
 *.p8
 AuthKey_*.p8
@@ -28,10 +29,11 @@ AuthKey_*.p8
 secrets.plist
 
 # IDE
-.vscode/
 .idea/
 
 # Logs
 *.log
 *.tmp
 *.bak
+.gitignore
+branch_structure.json

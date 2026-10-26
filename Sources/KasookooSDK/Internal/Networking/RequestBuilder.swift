@@ -38,7 +38,7 @@ internal enum SDKVersion {
     /// Keep in step with the git tag. Reported as `X-Kasookoo-SDK` on every
     /// request and as `service.version` on every span, so a wrong value here
     /// misattributes production telemetry.
-    static let current = "1.1.0"
+    static let current = "1.2.0"
 }
 
 // MARK: - Build

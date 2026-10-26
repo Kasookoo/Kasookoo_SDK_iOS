@@ -46,32 +46,85 @@ internal final class Logger: @unchecked Sendable {
     
     /// Logs a verbose message (most detailed level).
     func verbose(_ message: @autoclosure () -> String, file: String = #fileID, line: Int = #line) {
-        guard shouldLog(.verbose) else { return }
-        emit(level: .verbose, message: message(), file: file, line: line)
+        log(.verbose, message, file: file, line: line)
     }
     
     /// Logs a debug message.
     func debug(_ message: @autoclosure () -> String, file: String = #fileID, line: Int = #line) {
-        guard shouldLog(.debug) else { return }
-        emit(level: .debug, message: message(), file: file, line: line)
+        log(.debug, message, file: file, line: line)
     }
     
     /// Logs an informational message.
     func info(_ message: @autoclosure () -> String, file: String = #fileID, line: Int = #line) {
-        guard shouldLog(.info) else { return }
-        emit(level: .info, message: message(), file: file, line: line)
+        log(.info, message, file: file, line: line)
     }
     
     /// Logs a warning message.
     func warning(_ message: @autoclosure () -> String, file: String = #fileID, line: Int = #line) {
-        guard shouldLog(.warning) else { return }
-        emit(level: .warning, message: message(), file: file, line: line)
+        log(.warning, message, file: file, line: line)
     }
     
     /// Logs an error message.
     func error(_ message: @autoclosure () -> String, file: String = #fileID, line: Int = #line) {
-        guard shouldLog(.error) else { return }
-        emit(level: .error, message: message(), file: file, line: line)
+        log(.error, message, file: file, line: line)
+    }
+
+    // MARK: - Telemetry Export
+
+    /// Receives every line at or above the export level, independent of the
+    /// console level (a release app logs nothing to the console but still
+    /// reports to Loki).
+    typealias ExportSink = @Sendable (
+        _ level: LoggingConfig.Level,
+        _ category: String,
+        _ message: String,
+        _ file: String,
+        _ line: Int
+    ) -> Void
+
+    private let exportLock = NSLock()
+    private var exportSink: ExportSink?
+    private var exportLevel: LoggingConfig.Level = .none
+
+    /// Forwards log lines at or above `level` to `sink` (the telemetry
+    /// pipeline). Pass `nil` to stop.
+    func setExport(level: LoggingConfig.Level, sink: ExportSink?) {
+        exportLock.lock()
+        defer { exportLock.unlock() }
+        exportLevel = sink == nil ? .none : level
+        exportSink = sink
+    }
+
+    /// A logger with the same configuration that never exports. Used by the
+    /// telemetry pipeline itself, so a failed upload's warning is not queued
+    /// for upload again (a loop while the device is offline).
+    func makeNonExportingChild(category: String) -> Logger {
+        Logger(config: config, category: category)
+    }
+
+    private func exportTarget(for level: LoggingConfig.Level) -> ExportSink? {
+        exportLock.lock()
+        defer { exportLock.unlock() }
+        guard let exportSink, level != .none, exportLevel != .none,
+              level.priority <= exportLevel.priority else { return nil }
+        return exportSink
+    }
+
+    private func log(
+        _ level: LoggingConfig.Level,
+        _ message: () -> String,
+        file: String,
+        line: Int
+    ) {
+        let toConsole = shouldLog(level)
+        let sink = exportTarget(for: level)
+        guard toConsole || sink != nil else { return }
+
+        let text = message()
+        if toConsole {
+            emit(level: level, message: text, file: file, line: line)
+        }
+        sink?(level, category, text, file, line)
     }
     
     // MARK: - Private Helpers

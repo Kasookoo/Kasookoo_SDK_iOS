@@ -99,6 +99,7 @@ public final class KasookooSDK: @unchecked Sendable {
                 await a.sipService.endAll()
                 await a.sessionManager.disconnect()
                 await a.notificationService.setIncomingCallHandler(nil)
+                a.logger.setExport(level: .none, sink: nil)
                 a.telemetry.shutdown()
             }
         }
@@ -334,6 +335,7 @@ public final class KasookooSDK: @unchecked Sendable {
         
         // Flush and stop the telemetry pipeline last, so anything emitted
         // during teardown still leaves the device.
+        bundle.logger.setExport(level: .none, sink: nil)
         bundle.telemetry.shutdown()
     }
     
