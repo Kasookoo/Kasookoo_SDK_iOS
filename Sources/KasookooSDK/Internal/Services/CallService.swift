@@ -356,9 +356,23 @@ internal actor CallService: CallServicing {
             
             logger.info("Incoming call \(callId): joined room '\(call.roomName)'")
             
-            // The call becomes `.connected` once the remote participant is seen
-            // (handled by handleLiveKitEvent), mirroring the outgoing flow.
-            let updated = try await transitionState(callId: callId, to: .connecting)
+            // The caller is normally in the room already. LiveKit lists
+            // participants who were present before we joined in
+            // `remoteParticipants` and does NOT call participantDidConnect for
+            // them, so waiting for `.remoteParticipantJoined` left the callee in
+            // `.connecting` forever: no `call.connected`, and the app's call
+            // screen stayed on "Connecting..." with no timer (QA, 2.0.0 (2)).
+            //
+            // A participantDidConnect that raced the join may already have moved
+            // the call to `.connected`; stepping it back to `.connecting` threw
+            // and failed the accept. Only move forward.
+            var updated = await stateStore.getCall(callId)
+            if updated?.state == .ringing {
+                updated = try await transitionState(callId: callId, to: .connecting) ?? updated
+            }
+            if updated?.state == .connecting, await roomManager.hasRemoteParticipants {
+                updated = try await transitionState(callId: callId, to: .connected) ?? updated
+            }
             return updated ?? call
             
         } catch {

@@ -63,6 +63,13 @@ internal final class LiveKitRoomManager: NSObject {
     
     /// The room name we connected to.
     private(set) var roomName: String?
+
+    /// Whether anyone else is in the room right now. Participants who were
+    /// already there when we joined are only listed here — LiveKit does not
+    /// call `participantDidConnect` for them.
+    var hasRemoteParticipants: Bool {
+        !room.remoteParticipants.isEmpty
+    }
     
     /// The local participant identity (typically the user's email).
     private(set) var localIdentity: String?
