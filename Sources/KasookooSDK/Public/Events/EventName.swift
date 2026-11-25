@@ -59,7 +59,31 @@ public enum EventName {
     
     /// Emitted when a call failed to connect or was dropped abnormally.
     public static let callFailed = "call.failed"
-    
+
+    /// Emitted when a call is joining the media room, between ringing and
+    /// connected. Use it to show "Connecting…".
+    public static let callConnecting = "call.connecting"
+
+    // MARK: - In-Call Status Events (app-to-app and SIP)
+    //
+    // Data always carries `callId` and `isSip` (bool).
+
+    /// The microphone was muted (from the app or the system call screen).
+    public static let callMuted = "call.muted"
+
+    /// The microphone was unmuted.
+    public static let callUnmuted = "call.unmuted"
+
+    /// The call was put on hold on this device.
+    public static let callHeld = "call.held"
+
+    /// The call was resumed from hold.
+    public static let callResumed = "call.resumed"
+
+    /// The audio route changed during a call. Data carries `routeId`,
+    /// `routeName` and `routeKind` when the new route is known.
+    public static let audioRouteChanged = "audio.routeChanged"
+
     // MARK: - SIP Events
     
     /// Emitted when an outgoing SIP call is being placed.
@@ -100,6 +124,8 @@ public enum EventName {
         sdkReady, sdkConnectionChanged, sdkError,
         sessionExpiring, sessionRefreshed, sessionExpired,
         callIncoming, callRinging, callConnected, callEnded, callFailed,
+        callConnecting, callMuted, callUnmuted, callHeld, callResumed,
+        audioRouteChanged,
         sipCalling, sipConnected, sipEnded, sipFailed,
         messageReceived, messageSent, messageRead, conversationUpdated,
         notificationReceived

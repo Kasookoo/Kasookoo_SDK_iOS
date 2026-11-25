@@ -84,9 +84,49 @@ public protocol CallServicing: Sendable {
     ///   - callId: The ID of the active call.
     /// - Throws: `KasookooError.callFailed` if the call is unknown or audio routing fails.
     func setSpeakerEnabled(_ enabled: Bool, callId: String) async throws
-    
+
+    // MARK: - Audio Routes
+
+    /// The audio routes the call can use right now: earpiece, loudspeaker,
+    /// and any connected wired headset, Bluetooth device or car kit.
+    ///
+    /// Exactly one route has `isActive == true` when the current route is
+    /// known. Observe `EventName.audioRouteChanged` to refresh a picker.
+    ///
+    /// - Parameter callId: The ID of the active call.
+    /// - Returns: The available routes, or an empty list if the call is unknown.
+    func availableAudioRoutes(callId: String) async -> [AudioRoute]
+
+    /// Switches call audio to a route from `availableAudioRoutes(callId:)`.
+    ///
+    /// - Parameters:
+    ///   - route: The route to use.
+    ///   - callId: The ID of the active call.
+    /// - Throws: `KasookooError.callFailed` if the call is not active or the
+    ///   route has gone away (`details["reason"] == "route_unavailable"`).
+    func setAudioRoute(_ route: AudioRoute, callId: String) async throws
+
+    // MARK: - Hold
+
+    /// Puts a connected call on hold, or resumes it.
+    ///
+    /// On hold the microphone is off and incoming audio is stopped. The other
+    /// participant hears silence; the backend is not notified. Muting while
+    /// on hold is remembered and applied on resume.
+    ///
+    /// Emits `call.held` / `call.resumed`.
+    ///
+    /// - Parameters:
+    ///   - held: `true` to hold, `false` to resume.
+    ///   - callId: The ID of the call.
+    /// - Throws: `KasookooError.callFailed` if the call is not connected.
+    func setOnHold(_ held: Bool, callId: String) async throws
+
+    /// Whether the call is on hold on this device.
+    func isOnHold(callId: String) async -> Bool
+
     // MARK: - State
-    
+
     /// Returns the currently active call, if any.
     ///
     /// - Returns: The active `CallInfo`, or nil if no call is active.
@@ -134,5 +174,40 @@ public extension CallServicing {
             )
         }
         try await setSpeakerEnabled(enabled, callId: active.id)
+    }
+
+    /// Audio routes for the active call, or an empty list if there is none.
+    func availableAudioRoutes() async -> [AudioRoute] {
+        guard let active = await getActiveCall() else { return [] }
+        return await availableAudioRoutes(callId: active.id)
+    }
+
+    /// Switches audio for the active call.
+    ///
+    /// - Throws: `KasookooError.callFailed` if there is no active call or the
+    ///   route is unavailable.
+    func setAudioRoute(_ route: AudioRoute) async throws {
+        guard let active = await getActiveCall() else {
+            throw KasookooError.callFailed(
+                message: "No active call to route audio for.",
+                retryable: false,
+                details: ["action": "setAudioRoute", "reason": "no_active_call"]
+            )
+        }
+        try await setAudioRoute(route, callId: active.id)
+    }
+
+    /// Holds or resumes the active call.
+    ///
+    /// - Throws: `KasookooError.callFailed` if there is no active call.
+    func setOnHold(_ held: Bool) async throws {
+        guard let active = await getActiveCall() else {
+            throw KasookooError.callFailed(
+                message: "No active call to \(held ? "hold" : "resume").",
+                retryable: false,
+                details: ["action": held ? "hold" : "resume", "reason": "no_active_call"]
+            )
+        }
+        try await setOnHold(held, callId: active.id)
     }
 }

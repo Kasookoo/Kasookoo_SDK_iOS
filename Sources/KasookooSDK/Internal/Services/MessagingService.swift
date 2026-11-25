@@ -310,8 +310,65 @@ internal actor MessagingService: MessagingServicing {
         )
     }
     
+    // MARK: - MessagingServicing: findConversation (KSA-307)
+
+    /// Page size and page cap for `findConversation`.
+    private static let findPageSize = 50
+    private static let findMaxPages = 20
+
+    func findConversation(with participant: UserReference) async throws -> Conversation? {
+        let target = participant.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else {
+            throw KasookooError.configInvalid(
+                "findConversation needs a non-empty email or user id.",
+                details: ["participant": "empty"]
+            )
+        }
+
+        var matches: [Conversation] = []
+        var skip = 0
+        for _ in 0..<Self.findMaxPages {
+            let page = try await listConversations(
+                filters: ConversationFilters(skip: skip, limit: Self.findPageSize)
+            )
+            // Resolve after each page: listing may have just cached the
+            // email → user id mapping we need.
+            let targetUserId = await stateStore.resolveUserId(from: participant)
+            let targetEmail = participant.isEmail ? target.lowercased() : nil
+
+            matches += page.items.filter { conversation in
+                if let targetUserId, conversation.participantUserIds.contains(targetUserId) {
+                    return true
+                }
+                if let targetEmail,
+                   conversation.participantEmails.contains(where: { $0.lowercased() == targetEmail }) {
+                    return true
+                }
+                if participant.isUserId, conversation.participantUserIds.contains(target) {
+                    return true
+                }
+                return false
+            }
+
+            guard page.hasMore, !page.items.isEmpty else { break }
+            skip += page.items.count
+        }
+
+        // Prefer a one-to-one conversation, then the most recent one.
+        return matches.sorted { a, b in
+            let aDirect = Self.participantCount(a) <= 2
+            let bDirect = Self.participantCount(b) <= 2
+            if aDirect != bDirect { return aDirect }
+            return a.lastUpdatedAt > b.lastUpdatedAt
+        }.first
+    }
+
+    private static func participantCount(_ conversation: Conversation) -> Int {
+        max(conversation.participantUserIds.count, conversation.participantEmails.count)
+    }
+
     // MARK: - MessagingServicing: getMessages
-    
+
     func getMessages(
         conversationId: String,
         paging: MessagePaging

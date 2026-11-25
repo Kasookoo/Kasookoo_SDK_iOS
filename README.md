@@ -127,6 +127,42 @@ try await sdk.sip.endCall(callId: call.id)
 Application to application audio calls use `sdk.call` in a similar way. See the
 feature guides for the full parameters and call controls.
 
+### Hold, audio routes and call status
+
+Both `sdk.call` and `sdk.sip` offer the same in call controls.
+
+```swift
+// hold and resume (connected calls only)
+try await sdk.call.setOnHold(true, callId: call.id)
+try await sdk.call.setOnHold(false, callId: call.id)
+
+// list earpiece, speaker, wired and Bluetooth devices, then pick one
+let routes = await sdk.call.availableAudioRoutes(callId: call.id)
+if let airpods = routes.first(where: { $0.kind == .bluetooth }) {
+    try await sdk.call.setAudioRoute(airpods, callId: call.id)
+}
+```
+
+Hold is done on the device: the microphone is turned off and incoming audio is
+stopped, so the other side hears silence. Muting while on hold is remembered
+and applied on resume.
+
+In call status events: `call.connecting`, `call.muted`, `call.unmuted`,
+`call.held`, `call.resumed` and `audio.routeChanged`. Each carries `callId` and
+`isSip`.
+
+A control that cannot be used right now (unknown call, call not connected yet)
+throws `KasookooError.callFailed` with `details["action"]` and
+`details["reason"]` (`unknown_call`, `invalid_state` or `route_unavailable`).
+
+### Opening an existing conversation
+
+```swift
+if let conversation = try await sdk.messaging.findConversation(with: .email("sam@example.com")) {
+    // keep sending to conversation.roomName
+}
+```
+
 ### Observing events
 
 ```swift
