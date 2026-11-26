@@ -60,6 +60,9 @@ internal actor CallService: CallServicing {
     func start(params: StartCallParams) async throws -> CallInfo {
         // Validate input
         try params.validate()
+        // Before any backend call, so the callee is never rung for a call
+        // that cannot carry audio.
+        try CallControlValidation.requireMicrophoneNotDenied(action: "start")
         
         guard config.features.calling else {
             throw KasookooError.callFailed(
@@ -311,6 +314,8 @@ internal actor CallService: CallServicing {
             logger.debug("accept() already in progress for \(callId) — ignoring duplicate")
             return call
         }
+        try CallControlValidation.requireMicrophoneNotDenied(action: "accept")
+
         acceptingCallIds.insert(callId)
         defer { acceptingCallIds.remove(callId) }
         
@@ -520,16 +525,18 @@ internal actor CallService: CallServicing {
     // MARK: - CallServicing: In-Call Audio Controls
     
     func setMuted(_ muted: Bool, callId requestedId: String) async throws {
-        let callId = canonicalId(requestedId)
-        guard let manager = roomManagers[callId] else {
-            throw KasookooError.callFailed(
-                message: "Cannot toggle mute for unknown or inactive call: \(callId)",
-                retryable: false
-            )
-        }
+        let (callId, manager) = try await requireControllableCall(
+            requestedId,
+            action: muted ? "mute" : "unmute",
+            allowedStates: CallControlValidation.audioStates
+        )
+        let wasMuted = !(await manager.isMicrophoneEnabled)
         // LiveKit uses "microphone enabled" semantics; muted == mic disabled.
         try await manager.setMicrophoneEnabled(!muted)
         logger.info("Call \(callId) microphone \(muted ? "muted" : "unmuted")")
+        if wasMuted != muted {
+            await emitControlEvent(muted ? EventName.callMuted : EventName.callUnmuted, callId: callId)
+        }
     }
     
     func isMuted(callId requestedId: String) async -> Bool {
@@ -542,28 +549,88 @@ internal actor CallService: CallServicing {
     }
     
     func setSpeakerEnabled(_ enabled: Bool, callId requestedId: String) async throws {
-        let callId = canonicalId(requestedId)
-        guard let manager = roomManagers[callId] else {
-            throw KasookooError.callFailed(
-                message: "Cannot toggle speaker for unknown or inactive call: \(callId)",
-                retryable: false
-            )
-        }
+        let (callId, manager) = try await requireControllableCall(
+            requestedId,
+            action: "setSpeaker",
+            allowedStates: CallControlValidation.audioStates
+        )
         try await manager.setSpeakerEnabled(enabled)
         logger.info("Call \(callId) speaker \(enabled ? "on" : "off")")
     }
-    
+
+    // MARK: - CallServicing: Audio Routes
+
+    func availableAudioRoutes(callId requestedId: String) async -> [AudioRoute] {
+        guard let manager = roomManagers[canonicalId(requestedId)] else { return [] }
+        return await manager.availableAudioRoutes()
+    }
+
+    func setAudioRoute(_ route: AudioRoute, callId requestedId: String) async throws {
+        let (callId, manager) = try await requireControllableCall(
+            requestedId,
+            action: "setAudioRoute",
+            allowedStates: CallControlValidation.audioStates
+        )
+        try await manager.setAudioRoute(route)
+        logger.info("Call \(callId) audio route → \(route.kind.rawValue)")
+    }
+
+    // MARK: - CallServicing: Hold
+
+    func setOnHold(_ held: Bool, callId requestedId: String) async throws {
+        let (callId, manager) = try await requireControllableCall(
+            requestedId,
+            action: held ? "hold" : "resume",
+            allowedStates: CallControlValidation.connectedOnly
+        )
+        guard await manager.isOnHold != held else { return }
+        try await manager.setOnHold(held)
+        await emitControlEvent(held ? EventName.callHeld : EventName.callResumed, callId: callId)
+    }
+
+    func isOnHold(callId requestedId: String) async -> Bool {
+        guard let manager = roomManagers[canonicalId(requestedId)] else { return false }
+        return await manager.isOnHold
+    }
+
     /// Sends a DTMF digit on an active call. Used for incoming SIP calls,
     /// which `CallService` owns once accepted (keypad on the CallKit screen).
     func sendDTMF(_ digit: String, callId requestedId: String) async throws {
-        let callId = canonicalId(requestedId)
-        guard let manager = roomManagers[callId] else {
-            throw KasookooError.callFailed(
-                message: "Cannot send DTMF for unknown or inactive call: \(callId)",
-                retryable: false
-            )
-        }
+        let (_, manager) = try await requireControllableCall(
+            requestedId,
+            action: "dtmf",
+            allowedStates: CallControlValidation.connectedOnly
+        )
         try await manager.sendDTMF(digit)
+    }
+
+    // MARK: - Call Control Validation (KSA-328)
+
+    /// Resolves a call for an in-call control, or throws a `callFailed`
+    /// error saying why the control cannot be used.
+    ///
+    /// `details` always carries `action`, `callId` and `reason`
+    /// (`unknown_call`, `invalid_state`), plus `state` when known, so the app
+    /// can show a specific message.
+    private func requireControllableCall(
+        _ requestedId: String,
+        action: String,
+        allowedStates: Set<CallState>
+    ) async throws -> (String, LiveKitRoomManager) {
+        let callId = canonicalId(requestedId)
+        let call = await stateStore.getCall(callId)
+        guard let manager = roomManagers[callId], let call else {
+            throw CallControlValidation.unknownCall(callId: callId, action: action)
+        }
+        guard allowedStates.contains(call.state) else {
+            throw CallControlValidation.invalidState(callId: callId, action: action, state: call.state)
+        }
+        return (callId, manager)
+    }
+
+    private func emitControlEvent(_ name: String, callId: String) async {
+        guard let call = await stateStore.getCall(callId) else { return }
+        await emitCallEvent(name, call: call, extra: ["isSip": .bool(call.isSip)])
     }
     
     // MARK: - CallServicing: getActiveCall
@@ -607,7 +674,8 @@ internal actor CallService: CallServicing {
                 connectedAt: connectedAt,
                 endedAt: endedAt,
                 isRecording: existing.isRecording,
-                isPushNotification: existing.isPushNotification
+                isPushNotification: existing.isPushNotification,
+                isSip: existing.isSip
             )
         }
         
@@ -641,7 +709,8 @@ internal actor CallService: CallServicing {
                     connectedAt: existing.connectedAt,
                     endedAt: Date(),
                     isRecording: existing.isRecording,
-                    isPushNotification: existing.isPushNotification
+                    isPushNotification: existing.isPushNotification,
+                    isSip: existing.isSip
                 )
             }
             
@@ -749,9 +818,23 @@ internal actor CallService: CallServicing {
             
         case .roomReconnecting:
             logger.info("Room reconnecting for call \(callId)")
+            if let call = await stateStore.getCall(callId), !call.state.isTerminal {
+                await emitControlEvent(EventName.callReconnecting, callId: callId)
+            }
             
         case .roomReconnected:
             logger.info("Room reconnected for call \(callId)")
+            if let call = await stateStore.getCall(callId), !call.state.isTerminal {
+                await emitControlEvent(EventName.callReconnected, callId: callId)
+            }
+
+        case .audioRouteChanged(let current):
+            guard let call = await stateStore.getCall(callId), !call.state.isTerminal else { return }
+            await emitCallEvent(
+                EventName.audioRouteChanged,
+                call: call,
+                extra: CallControlValidation.routeEventData(current, isSip: call.isSip)
+            )
         }
     }
 }

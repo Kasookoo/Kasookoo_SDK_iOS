@@ -78,6 +78,9 @@ internal actor SipService: SipServicing {
     @discardableResult
     func dial(params: SipDialParams) async throws -> CallInfo {
         try params.validate()
+        // Before the backend dials out, so the phone is never rung for a call
+        // that cannot carry audio.
+        try CallControlValidation.requireMicrophoneNotDenied(action: "dial")
         
         guard config.features.sipCalling else {
             throw KasookooError.callFailed(
@@ -413,41 +416,97 @@ internal actor SipService: SipServicing {
     
     /// Mutes or unmutes the local microphone for a SIP call.
     func setMuted(_ muted: Bool, callId requestedId: String) async throws {
-        let callId = canonicalId(requestedId)
-        guard let manager = roomManagers[callId] else {
-            throw KasookooError.callFailed(
-                message: "Cannot toggle mute for unknown or inactive SIP call: \(callId)",
-                retryable: false
-            )
-        }
+        let (callId, manager) = try await requireControllableSipCall(
+            requestedId,
+            action: muted ? "mute" : "unmute",
+            allowedStates: CallControlValidation.audioStates
+        )
+        let wasMuted = !(await manager.isMicrophoneEnabled)
         try await manager.setMicrophoneEnabled(!muted)
         logger.info("SIP call \(callId) microphone \(muted ? "muted" : "unmuted")")
+        if wasMuted != muted {
+            await emitSipControlEvent(muted ? EventName.callMuted : EventName.callUnmuted, callId: callId)
+        }
     }
-    
+
+    func isMuted(callId requestedId: String) async -> Bool {
+        guard let manager = roomManagers[canonicalId(requestedId)] else { return false }
+        return !(await manager.isMicrophoneEnabled)
+    }
+
     /// Routes SIP call audio to the loudspeaker (true) or earpiece (false).
     func setSpeakerEnabled(_ enabled: Bool, callId requestedId: String) async throws {
-        let callId = canonicalId(requestedId)
-        guard let manager = roomManagers[callId] else {
-            throw KasookooError.callFailed(
-                message: "Cannot toggle speaker for unknown or inactive SIP call: \(callId)",
-                retryable: false
-            )
-        }
+        let (callId, manager) = try await requireControllableSipCall(
+            requestedId,
+            action: "setSpeaker",
+            allowedStates: CallControlValidation.audioStates
+        )
         try await manager.setSpeakerEnabled(enabled)
         logger.info("SIP call \(callId) speaker \(enabled ? "on" : "off")")
     }
-    
+
+    // MARK: - Audio Routes
+
+    func availableAudioRoutes(callId requestedId: String) async -> [AudioRoute] {
+        guard let manager = roomManagers[canonicalId(requestedId)] else { return [] }
+        return await manager.availableAudioRoutes()
+    }
+
+    func setAudioRoute(_ route: AudioRoute, callId requestedId: String) async throws {
+        let (callId, manager) = try await requireControllableSipCall(
+            requestedId,
+            action: "setAudioRoute",
+            allowedStates: CallControlValidation.audioStates
+        )
+        try await manager.setAudioRoute(route)
+        logger.info("SIP call \(callId) audio route → \(route.kind.rawValue)")
+    }
+
+    // MARK: - Hold
+
+    func setOnHold(_ held: Bool, callId requestedId: String) async throws {
+        let (callId, manager) = try await requireControllableSipCall(
+            requestedId,
+            action: held ? "hold" : "resume",
+            allowedStates: CallControlValidation.connectedOnly
+        )
+        guard await manager.isOnHold != held else { return }
+        try await manager.setOnHold(held)
+        await emitSipControlEvent(held ? EventName.callHeld : EventName.callResumed, callId: callId)
+    }
+
+    func isOnHold(callId requestedId: String) async -> Bool {
+        guard let manager = roomManagers[canonicalId(requestedId)] else { return false }
+        return await manager.isOnHold
+    }
+
     // MARK: - DTMF
-    
+
     func sendDTMF(_ digit: String, callId requestedId: String) async throws {
-        let callId = canonicalId(requestedId)
-        guard let manager = roomManagers[callId] else {
-            throw KasookooError.callFailed(
-                message: "Cannot send DTMF for unknown or inactive SIP call: \(callId)",
-                retryable: false
-            )
-        }
+        let (_, manager) = try await requireControllableSipCall(
+            requestedId,
+            action: "dtmf",
+            allowedStates: CallControlValidation.connectedOnly
+        )
         try await manager.sendDTMF(digit)
+    }
+
+    // MARK: - Call Control Validation (KSA-328)
+
+    private func requireControllableSipCall(
+        _ requestedId: String,
+        action: String,
+        allowedStates: Set<CallState>
+    ) async throws -> (String, LiveKitRoomManager) {
+        let callId = canonicalId(requestedId)
+        let call = await stateStore.getCall(callId)
+        guard let manager = roomManagers[callId], let call else {
+            throw CallControlValidation.unknownCall(callId: callId, action: action)
+        }
+        guard allowedStates.contains(call.state) else {
+            throw CallControlValidation.invalidState(callId: callId, action: action, state: call.state)
+        }
+        return (callId, manager)
     }
     
     // MARK: - Private: Failure Handling
@@ -556,9 +615,23 @@ internal actor SipService: SipServicing {
             
         case .roomReconnecting:
             logger.info("SIP room reconnecting for call \(callId)")
+            if let call = await stateStore.getCall(callId), !call.state.isTerminal {
+                await emitSipControlEvent(EventName.callReconnecting, callId: callId)
+            }
             
         case .roomReconnected:
             logger.info("SIP room reconnected for call \(callId)")
+            if let call = await stateStore.getCall(callId), !call.state.isTerminal {
+                await emitSipControlEvent(EventName.callReconnected, callId: callId)
+            }
+
+        case .audioRouteChanged(let current):
+            guard let call = await stateStore.getCall(callId), !call.state.isTerminal else { return }
+            await emitSipControlEvent(
+                EventName.audioRouteChanged,
+                callId: callId,
+                extra: CallControlValidation.routeEventData(current, isSip: true)
+            )
         }
     }
     
@@ -586,6 +659,30 @@ internal actor SipService: SipServicing {
         await eventBus.emit(event)
     }
     
+    /// Emits an in-call status event (mute, hold, audio route) for a SIP call.
+    private func emitSipControlEvent(
+        _ name: String,
+        callId: String,
+        extra: [String: AnyCodableValue] = ["isSip": .bool(true)]
+    ) async {
+        var data: [String: AnyCodableValue] = [
+            "callId": .string(callId),
+            "isSip": .bool(true)
+        ]
+        if let call = await stateStore.getCall(callId) {
+            data["roomName"] = .string(call.roomName)
+            data["state"] = .string(call.state.rawValue)
+        }
+        for (key, value) in extra { data[key] = value }
+        let event = SDKEvent(
+            name: name,
+            organizationId: config.organizationId,
+            userEmail: await stateStore.currentUserEmail(),
+            data: data
+        )
+        await eventBus.emit(event)
+    }
+
     private func emitSipFailedEvent(callId: String, error: KasookooError) async {
         let event = SDKEvent(
             name: EventName.sipFailed,

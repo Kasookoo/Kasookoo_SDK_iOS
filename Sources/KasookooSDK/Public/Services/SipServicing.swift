@@ -52,7 +52,37 @@ public protocol SipServicing: Sendable {
     ///   - callId: The ID of the active SIP call.
     /// - Throws: `KasookooError.callFailed` if the call is unknown or audio routing fails.
     func setSpeakerEnabled(_ enabled: Bool, callId: String) async throws
-    
+
+    /// Whether the microphone is muted for a SIP call.
+    ///
+    /// - Returns: `true` if muted, `false` if unmuted or the call is unknown.
+    func isMuted(callId: String) async -> Bool
+
+    // MARK: - Audio Routes
+
+    /// The audio routes the SIP call can use right now. See
+    /// `CallServicing.availableAudioRoutes(callId:)`.
+    func availableAudioRoutes(callId: String) async -> [AudioRoute]
+
+    /// Switches SIP call audio to a route from `availableAudioRoutes(callId:)`.
+    ///
+    /// - Throws: `KasookooError.callFailed` if the call is not active or the
+    ///   route has gone away.
+    func setAudioRoute(_ route: AudioRoute, callId: String) async throws
+
+    // MARK: - Hold
+
+    /// Puts a connected SIP call on hold, or resumes it.
+    ///
+    /// Hold is local: the microphone is off and incoming audio is stopped.
+    /// The phone on the other end hears silence, not hold music.
+    ///
+    /// - Throws: `KasookooError.callFailed` if the call is not connected.
+    func setOnHold(_ held: Bool, callId: String) async throws
+
+    /// Whether the SIP call is on hold on this device.
+    func isOnHold(callId: String) async -> Bool
+
     // MARK: - DTMF
     
     /// Sends a DTMF tone on an active SIP call.

@@ -67,10 +67,11 @@ internal struct CallStateMachine {
     static func eventName(for state: CallState) -> String? {
         switch state {
         case .ringing: return EventName.callRinging
+        case .connecting: return EventName.callConnecting
         case .connected: return EventName.callConnected
         case .ended, .rejected, .missed: return EventName.callEnded
         case .failed: return EventName.callFailed
-        case .initiating, .connecting, .ending: return nil
+        case .initiating, .ending: return nil
         }
     }
 }

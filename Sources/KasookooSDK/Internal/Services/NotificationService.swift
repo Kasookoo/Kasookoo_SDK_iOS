@@ -545,6 +545,10 @@ extension NotificationService: CallKitProviderDelegate {
         await processMute(uuid: uuid, muted: muted)
     }
     
+    nonisolated func callKitDidSetHeld(uuid: UUID, held: Bool) async {
+        await processHold(uuid: uuid, held: held)
+    }
+
     nonisolated func callKitDidPlayDTMF(uuid: UUID, digits: String) async {
         await processDTMF(uuid: uuid, digits: digits)
     }
@@ -586,7 +590,21 @@ extension NotificationService: CallKitProviderDelegate {
             logger.warning("Could not apply CallKit mute to call \(callId): \(error.localizedDescription)")
         }
     }
-    
+
+    /// Applies hold / resume from the system call screen (including
+    /// "Hold & Accept" when another call comes in). KSA-321.
+    private func processHold(uuid: UUID, held: Bool) async {
+        guard let callId = callKitProvider?.callId(for: uuid) else {
+            logger.warning("Hold received for unknown UUID: \(uuid)")
+            return
+        }
+        do {
+            try await callService?.setOnHold(held, callId: callId)
+        } catch {
+            logger.warning("Could not apply CallKit hold to call \(callId): \(error.localizedDescription)")
+        }
+    }
+
     /// Sends keypad digits entered on the system call screen (SIP calls).
     private func processDTMF(uuid: UUID, digits: String) async {
         guard let callId = callKitProvider?.callId(for: uuid) else { return }

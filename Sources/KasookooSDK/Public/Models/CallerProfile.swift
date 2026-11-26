@@ -81,10 +81,49 @@ public struct CallerProfile: Sendable, Hashable, Codable {
     
     // MARK: - Validation
     
-    /// Validates the profile fields.
+    /// Validates the profile fields before they are sent to the backend.
     ///
-    /// - Throws: `KasookooError.configInvalid` if validation fails.
+    /// On top of the participant checks (name and email present, email
+    /// format), the user's own profile must have:
+    /// - no spaces around the email, so the same person is not registered
+    ///   twice as "a@b.com" and " a@b.com";
+    /// - a phone number that looks like one, if given (7–15 digits, optional
+    ///   leading `+`; spaces, dashes, dots and brackets are ignored);
+    /// - a name of at most 100 characters.
+    ///
+    /// - Throws: `KasookooError.configInvalid` with one entry per bad field in
+    ///   `details`.
     public func validate() throws {
-        try asParticipant().validate()
+        var errors: [String: String] = [:]
+        do {
+            try asParticipant().validate()
+        } catch let error as KasookooError {
+            errors.merge(error.details ?? [:]) { first, _ in first }
+        }
+
+        if errors["email"] == nil, email != email.trimmingCharacters(in: .whitespacesAndNewlines) {
+            errors["email"] = "email must not start or end with spaces"
+        }
+
+        let phone = phoneNumber.trimmingCharacters(in: .whitespaces)
+        if !phone.isEmpty && !Self.isPlausiblePhoneNumber(phone) {
+            errors["phoneNumber"] = "phoneNumber must be 7 to 15 digits, optionally starting with +"
+        }
+
+        if errors["name"] == nil, name.count > Self.maxNameLength {
+            errors["name"] = "name must be at most \(Self.maxNameLength) characters"
+        }
+
+        if !errors.isEmpty {
+            throw KasookooError.configInvalid("Invalid caller profile.", details: errors)
+        }
+    }
+
+    /// Longest display name accepted by `validate()`.
+    static let maxNameLength = 100
+
+    static func isPlausiblePhoneNumber(_ number: String) -> Bool {
+        let stripped = number.filter { !" -.()".contains($0) }
+        return stripped.range(of: #"^\+?[0-9]{7,15}$"#, options: .regularExpression) != nil
     }
 }

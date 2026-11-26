@@ -396,12 +396,28 @@ public final class KasookooSDK: @unchecked Sendable {
         // response decoder maps to `KasookooError.userNotFound`, so this call throws
         // before any identity is set. The app can catch `.userNotFound` to prompt
         // registration.
-        let response = try await bundle.apiClient.send(
-            endpoint: .identifyUser,
-            body: request,
-            responseType: IdentifyUserResponse.self,
-            retryPolicy: .default
-        )
+        let response: IdentifyUserResponse
+        do {
+            response = try await bundle.apiClient.send(
+                endpoint: .identifyUser,
+                body: request,
+                responseType: IdentifyUserResponse.self,
+                retryPolicy: .default
+            )
+        } catch let error as KasookooError where error.httpStatus == 409 || error.httpStatus == 422 {
+            // KSA-278: the backend rejected the record as a duplicate (409) or
+            // as invalid (422). Surface that as a profile problem the app can
+            // show, keeping the server's own details.
+            var details = error.details ?? [:]
+            details["reason"] = error.httpStatus == 409 ? "duplicate_user" : "invalid_user"
+            details["httpStatus"] = String(error.httpStatus ?? 0)
+            throw KasookooError.configInvalid(
+                error.httpStatus == 409
+                    ? "A different user record already uses this email or phone number."
+                    : "The backend rejected the user profile: \(error.message)",
+                details: details
+            )
+        }
 
         // A successful response with no user_id would leave the SDK in a half
         // identified state that messaging and calling cannot use, so fail cleanly

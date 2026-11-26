@@ -16,6 +16,7 @@ internal protocol CallKitProviderDelegate: AnyObject, Sendable {
     func callKitDidAnswerCall(uuid: UUID) async
     func callKitDidEndCall(uuid: UUID) async
     func callKitDidSetMuted(uuid: UUID, muted: Bool) async
+    func callKitDidSetHeld(uuid: UUID, held: Bool) async
     func callKitDidPlayDTMF(uuid: UUID, digits: String) async
     func callKitDidActivateAudioSession() async
     func callKitDidDeactivateAudioSession() async
@@ -165,9 +166,9 @@ internal final class CallKitProvider: NSObject, @unchecked Sendable {
         update.localizedCallerName = info.displayName
         update.hasVideo = false
         update.supportsDTMF = info.isSipCall
-        // Hold is not implemented (no CXSetHeldCallAction handling and no
-        // LiveKit-side hold), so it is not advertised.
-        update.supportsHolding = false
+        // Hold is local (KSA-321): microphone off and remote audio stopped.
+        // Advertised so "Hold & Accept" works when another call comes in.
+        update.supportsHolding = true
         update.supportsGrouping = false
         update.supportsUngrouping = false
         
@@ -299,8 +300,16 @@ extension CallKitProvider: CXProviderDelegate {
     }
     
     func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
-        // Hold is not supported (see `supportsHolding`).
-        action.fail()
+        let uuid: UUID = action.callUUID
+        let held = action.isOnHold
+        action.fulfill()
+
+        logger.info("CallKit: user \(held ? "held" : "resumed") call \(uuid)")
+
+        let del = currentDelegate()
+        Task {
+            await del?.callKitDidSetHeld(uuid: uuid, held: held)
+        }
     }
     
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {

@@ -63,6 +63,25 @@ public protocol MessagingServicing: Sendable {
     /// - Parameter filters: Optional filters for paging and search.
     /// - Returns: A paginated list of conversations.
     func listConversations(filters: ConversationFilters) async throws -> PaginatedResult<Conversation>
+
+    /// Finds the existing conversation between the current user and another
+    /// user, so every screen opens the same conversation instead of starting
+    /// a new one.
+    ///
+    /// Matches on user id or email (case-insensitive), whichever the
+    /// conversation lists. Pages through the current user's conversations
+    /// (up to 1,000). When several match, a one-to-one conversation is
+    /// preferred, then the most recently updated.
+    ///
+    /// To start a new conversation when this returns nil, `send` the first
+    /// message with your own room name; reuse `Conversation.roomName` after that.
+    ///
+    /// **Side effect:** like `listConversations`, this fills the email → userId
+    /// cache.
+    ///
+    /// - Parameter participant: The other user, by email or user id.
+    /// - Returns: The conversation, or nil if none exists yet.
+    func findConversation(with participant: UserReference) async throws -> Conversation?
     
     /// Fetches messages from a conversation.
     ///

@@ -150,7 +150,7 @@ internal actor MessagingService: MessagingServicing {
             )
         }
         
-        guard let receiverUserId = await stateStore.resolveUserId(from: params.receiver) else {
+        guard let receiverUserId = await resolveUserIdLoadingConversations(params.receiver) else {
             throw KasookooError.messageSendFailed(
                 message: "Cannot resolve receiver user_id. Pass .userId(...) directly or call listConversations() first to populate the cache.",
                 retryable: false,
@@ -310,8 +310,91 @@ internal actor MessagingService: MessagingServicing {
         )
     }
     
+    // MARK: - Receiver Resolution (KSA-303)
+
+    /// Resolves a user reference to a user id. When an email is not in the
+    /// cache yet, loads the user's conversations (which fill the cache) and
+    /// tries again, so sending by email works without the app having to list
+    /// conversations first. Returns nil if the user still cannot be found,
+    /// e.g. someone the current user has never messaged.
+    private func resolveUserIdLoadingConversations(_ reference: UserReference) async -> String? {
+        if let cached = await stateStore.resolveUserId(from: reference) {
+            return cached
+        }
+        guard reference.isEmail else { return nil }
+        var skip = 0
+        for _ in 0..<Self.findMaxPages {
+            guard let page = try? await performListConversations(
+                filters: ConversationFilters(skip: skip, limit: Self.findPageSize)
+            ) else { return nil }
+            if let resolved = await stateStore.resolveUserId(from: reference) {
+                return resolved
+            }
+            guard page.hasMore, !page.items.isEmpty else { break }
+            skip += page.items.count
+        }
+        return nil
+    }
+
+    // MARK: - MessagingServicing: findConversation (KSA-307)
+
+    /// Page size and page cap for `findConversation`.
+    private static let findPageSize = 50
+    private static let findMaxPages = 20
+
+    func findConversation(with participant: UserReference) async throws -> Conversation? {
+        let target = participant.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else {
+            throw KasookooError.configInvalid(
+                "findConversation needs a non-empty email or user id.",
+                details: ["participant": "empty"]
+            )
+        }
+
+        var matches: [Conversation] = []
+        var skip = 0
+        for _ in 0..<Self.findMaxPages {
+            let page = try await listConversations(
+                filters: ConversationFilters(skip: skip, limit: Self.findPageSize)
+            )
+            // Resolve after each page: listing may have just cached the
+            // email → user id mapping we need.
+            let targetUserId = await stateStore.resolveUserId(from: participant)
+            let targetEmail = participant.isEmail ? target.lowercased() : nil
+
+            matches += page.items.filter { conversation in
+                if let targetUserId, conversation.participantUserIds.contains(targetUserId) {
+                    return true
+                }
+                if let targetEmail,
+                   conversation.participantEmails.contains(where: { $0.lowercased() == targetEmail }) {
+                    return true
+                }
+                if participant.isUserId, conversation.participantUserIds.contains(target) {
+                    return true
+                }
+                return false
+            }
+
+            guard page.hasMore, !page.items.isEmpty else { break }
+            skip += page.items.count
+        }
+
+        // Prefer a one-to-one conversation, then the most recent one.
+        return matches.sorted { a, b in
+            let aDirect = Self.participantCount(a) <= 2
+            let bDirect = Self.participantCount(b) <= 2
+            if aDirect != bDirect { return aDirect }
+            return a.lastUpdatedAt > b.lastUpdatedAt
+        }.first
+    }
+
+    private static func participantCount(_ conversation: Conversation) -> Int {
+        max(conversation.participantUserIds.count, conversation.participantEmails.count)
+    }
+
     // MARK: - MessagingServicing: getMessages
-    
+
     func getMessages(
         conversationId: String,
         paging: MessagePaging
