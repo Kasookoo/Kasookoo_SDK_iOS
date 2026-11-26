@@ -148,8 +148,13 @@ stopped, so the other side hears silence. Muting while on hold is remembered
 and applied on resume.
 
 In call status events: `call.connecting`, `call.muted`, `call.unmuted`,
-`call.held`, `call.resumed` and `audio.routeChanged`. Each carries `callId` and
-`isSip`.
+`call.held`, `call.resumed`, `call.reconnecting`, `call.reconnected` and
+`audio.routeChanged`. Each carries `callId` and `isSip`.
+
+Starting, answering or dialling a call when the user has turned microphone
+access off throws `KasookooError.callFailed` with
+`details["reason"] == "microphone_permission_denied"`, before anything is sent
+to the backend.
 
 A control that cannot be used right now (unknown call, call not connected yet)
 throws `KasookooError.callFailed` with `details["action"]` and

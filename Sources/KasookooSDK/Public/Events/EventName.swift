@@ -80,6 +80,13 @@ public enum EventName {
     /// The call was resumed from hold.
     public static let callResumed = "call.resumed"
 
+    /// The network dropped and the call's media is reconnecting. Show
+    /// "Reconnecting…"; the call is not over.
+    public static let callReconnecting = "call.reconnecting"
+
+    /// The call's media reconnected after a network drop.
+    public static let callReconnected = "call.reconnected"
+
     /// The audio route changed during a call. Data carries `routeId`,
     /// `routeName` and `routeKind` when the new route is known.
     public static let audioRouteChanged = "audio.routeChanged"
@@ -125,6 +132,7 @@ public enum EventName {
         sessionExpiring, sessionRefreshed, sessionExpired,
         callIncoming, callRinging, callConnected, callEnded, callFailed,
         callConnecting, callMuted, callUnmuted, callHeld, callResumed,
+        callReconnecting, callReconnected,
         audioRouteChanged,
         sipCalling, sipConnected, sipEnded, sipFailed,
         messageReceived, messageSent, messageRead, conversationUpdated,

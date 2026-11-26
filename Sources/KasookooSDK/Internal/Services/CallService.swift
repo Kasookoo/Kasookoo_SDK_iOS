@@ -60,6 +60,9 @@ internal actor CallService: CallServicing {
     func start(params: StartCallParams) async throws -> CallInfo {
         // Validate input
         try params.validate()
+        // Before any backend call, so the callee is never rung for a call
+        // that cannot carry audio.
+        try CallControlValidation.requireMicrophoneNotDenied(action: "start")
         
         guard config.features.calling else {
             throw KasookooError.callFailed(
@@ -311,6 +314,8 @@ internal actor CallService: CallServicing {
             logger.debug("accept() already in progress for \(callId) — ignoring duplicate")
             return call
         }
+        try CallControlValidation.requireMicrophoneNotDenied(action: "accept")
+
         acceptingCallIds.insert(callId)
         defer { acceptingCallIds.remove(callId) }
         
@@ -813,9 +818,15 @@ internal actor CallService: CallServicing {
             
         case .roomReconnecting:
             logger.info("Room reconnecting for call \(callId)")
+            if let call = await stateStore.getCall(callId), !call.state.isTerminal {
+                await emitControlEvent(EventName.callReconnecting, callId: callId)
+            }
             
         case .roomReconnected:
             logger.info("Room reconnected for call \(callId)")
+            if let call = await stateStore.getCall(callId), !call.state.isTerminal {
+                await emitControlEvent(EventName.callReconnected, callId: callId)
+            }
 
         case .audioRouteChanged(let current):
             guard let call = await stateStore.getCall(callId), !call.state.isTerminal else { return }

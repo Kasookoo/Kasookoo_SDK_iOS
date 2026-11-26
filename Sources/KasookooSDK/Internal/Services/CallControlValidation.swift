@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import AVFoundation
 
 internal enum CallControlValidation {
 
@@ -38,6 +39,30 @@ internal enum CallControlValidation {
                 "state": state.rawValue
             ]
         )
+    }
+
+    // MARK: - Microphone Permission (KSA-175)
+
+    /// Throws before a call is placed, answered or dialled when the user has
+    /// turned microphone access off, so the call fails with a clear reason
+    /// instead of connecting without audio.
+    ///
+    /// Only an explicit denial is rejected. When the user has not been asked
+    /// yet, iOS shows its own prompt as the call starts, exactly as before.
+    static func requireMicrophoneNotDenied(action: String) throws {
+        guard microphonePermissionDenied else { return }
+        throw KasookooError.callFailed(
+            message: "Microphone access is turned off for this app.",
+            retryable: false,
+            details: ["action": action, "reason": "microphone_permission_denied"]
+        )
+    }
+
+    private static var microphonePermissionDenied: Bool {
+        if #available(iOS 17.0, *) {
+            return AVAudioApplication.shared.recordPermission == .denied
+        }
+        return AVAudioSession.sharedInstance().recordPermission == .denied
     }
 
     /// Event data for `audio.routeChanged`.

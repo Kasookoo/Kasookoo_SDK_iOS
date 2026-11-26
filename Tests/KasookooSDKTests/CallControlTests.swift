@@ -24,7 +24,8 @@ import Testing
     func newEventsRegistered() {
         for name in [
             EventName.callConnecting, EventName.callMuted, EventName.callUnmuted,
-            EventName.callHeld, EventName.callResumed, EventName.audioRouteChanged
+            EventName.callHeld, EventName.callResumed, EventName.audioRouteChanged,
+            EventName.callReconnecting, EventName.callReconnected
         ] {
             #expect(EventName.allEventNames.contains(name))
         }

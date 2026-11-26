@@ -150,7 +150,7 @@ internal actor MessagingService: MessagingServicing {
             )
         }
         
-        guard let receiverUserId = await stateStore.resolveUserId(from: params.receiver) else {
+        guard let receiverUserId = await resolveUserIdLoadingConversations(params.receiver) else {
             throw KasookooError.messageSendFailed(
                 message: "Cannot resolve receiver user_id. Pass .userId(...) directly or call listConversations() first to populate the cache.",
                 retryable: false,
@@ -310,6 +310,32 @@ internal actor MessagingService: MessagingServicing {
         )
     }
     
+    // MARK: - Receiver Resolution (KSA-303)
+
+    /// Resolves a user reference to a user id. When an email is not in the
+    /// cache yet, loads the user's conversations (which fill the cache) and
+    /// tries again, so sending by email works without the app having to list
+    /// conversations first. Returns nil if the user still cannot be found,
+    /// e.g. someone the current user has never messaged.
+    private func resolveUserIdLoadingConversations(_ reference: UserReference) async -> String? {
+        if let cached = await stateStore.resolveUserId(from: reference) {
+            return cached
+        }
+        guard reference.isEmail else { return nil }
+        var skip = 0
+        for _ in 0..<Self.findMaxPages {
+            guard let page = try? await performListConversations(
+                filters: ConversationFilters(skip: skip, limit: Self.findPageSize)
+            ) else { return nil }
+            if let resolved = await stateStore.resolveUserId(from: reference) {
+                return resolved
+            }
+            guard page.hasMore, !page.items.isEmpty else { break }
+            skip += page.items.count
+        }
+        return nil
+    }
+
     // MARK: - MessagingServicing: findConversation (KSA-307)
 
     /// Page size and page cap for `findConversation`.

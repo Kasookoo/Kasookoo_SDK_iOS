@@ -78,6 +78,9 @@ internal actor SipService: SipServicing {
     @discardableResult
     func dial(params: SipDialParams) async throws -> CallInfo {
         try params.validate()
+        // Before the backend dials out, so the phone is never rung for a call
+        // that cannot carry audio.
+        try CallControlValidation.requireMicrophoneNotDenied(action: "dial")
         
         guard config.features.sipCalling else {
             throw KasookooError.callFailed(
@@ -612,9 +615,15 @@ internal actor SipService: SipServicing {
             
         case .roomReconnecting:
             logger.info("SIP room reconnecting for call \(callId)")
+            if let call = await stateStore.getCall(callId), !call.state.isTerminal {
+                await emitSipControlEvent(EventName.callReconnecting, callId: callId)
+            }
             
         case .roomReconnected:
             logger.info("SIP room reconnected for call \(callId)")
+            if let call = await stateStore.getCall(callId), !call.state.isTerminal {
+                await emitSipControlEvent(EventName.callReconnected, callId: callId)
+            }
 
         case .audioRouteChanged(let current):
             guard let call = await stateStore.getCall(callId), !call.state.isTerminal else { return }
